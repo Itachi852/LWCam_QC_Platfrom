@@ -4,7 +4,8 @@
 .idea/
 .vscode/
 
-shared-images/test-data/
+/tecdocs/
+/shared-images/
 /scripts/
 /database/
 /docs/
