@@ -43,6 +43,7 @@ const insertInputEl = ref<HTMLInputElement | null>(null)
 const cropDragging = ref(false)
 const cropStart = ref({ x: 0, y: 0 })
 const cropSelection = reactive({ x: 0, y: 0, width: 0, height: 0 })
+const showMoreImageTools = ref(false)
 const rejectedImageIds = ref<number[]>([])
 const rejectReasons = reactive<Record<number, string>>({})
 const selectedImageIds = ref<number[]>([])
@@ -58,6 +59,23 @@ const showListChrome = computed(() => !isStandaloneQcRoute.value)
 const currentImageIndex = computed(() => {
   if (!current.value || !image.value) return 0
   return current.value.images.findIndex((item) => item.id === image.value?.id) + 1
+})
+
+const currentRejectReason = computed({
+  get() {
+    if (!image.value) return ''
+    return rejectReasons[image.value.id] || ''
+  },
+  set(value: string) {
+    if (!image.value) return
+    const imageId = image.value.id
+    if (value.trim() && !rejectedImageIds.value.includes(imageId)) {
+      rejectedImageIds.value = [...rejectedImageIds.value, imageId]
+    } else if (!value.trim()) {
+      rejectedImageIds.value = rejectedImageIds.value.filter((id) => id !== imageId)
+    }
+    rejectReasons[imageId] = value
+  },
 })
 
 const metadataGroups = computed(() => {
@@ -155,6 +173,29 @@ const editableTemplateFields = computed<MetadataTemplateField[]>(() =>
   }),
 )
 
+const metadataPayloadKeys: Array<keyof EditableFolderMetadata> = [
+  'coverTag',
+  'imageTags',
+  'title',
+  'volume',
+  'startDate',
+  'endDate',
+  'archivalRefNo',
+  'recordType',
+  'place',
+  'language',
+  'recordCustodian',
+  'captureOperatorId',
+  'captureOperatorName',
+  'digitizingEntity',
+]
+
+const metadataDirty = computed(() => {
+  const metadata = current.value?.metadata
+  if (!metadata) return false
+  return metadataPayloadKeys.some((key) => normalizeMetadataValue(metadataForm[key]) !== normalizeMetadataValue(metadata[key]))
+})
+
 function applyTaskUpdate(task: MetadataQcTask, selectedImageId?: number | null) {
   const visibleImages = task.images.filter((item) => item.draftState !== 'deleted')
   const visibleTask = { ...task, images: visibleImages, imageCount: visibleImages.length }
@@ -176,6 +217,10 @@ function optionValue(field: MetadataTemplateField, option: string) {
 
 function displayOption(option: string) {
   return option
+}
+
+function normalizeMetadataValue(value: unknown) {
+  return value === null || value === undefined ? '' : String(value)
 }
 
 function titleRecordType(title: string | null | undefined) {
@@ -402,9 +447,14 @@ async function openRejectDialog() {
       return
     }
   }
-  rejectedImageIds.value = image.value ? [image.value.id] : []
-  Object.keys(rejectReasons).forEach((key) => delete rejectReasons[Number(key)])
-  if (image.value) rejectReasons[image.value.id] = ''
+  const imageIds = Object.keys(rejectReasons)
+    .map(Number)
+    .filter((imageId) => (rejectReasons[imageId] || '').trim())
+  if (image.value && !imageIds.includes(image.value.id)) {
+    imageIds.push(image.value.id)
+  }
+  rejectedImageIds.value = imageIds
+  syncRejectReasons(imageIds)
   rejectDialogVisible.value = true
 }
 
@@ -442,7 +492,7 @@ async function submitReject() {
   }
 }
 
-function openMetadataEditor() {
+function fillMetadataFormFromCurrent() {
   if (!current.value) return
   const metadata = current.value.metadata
   Object.assign(metadataForm, {
@@ -462,6 +512,10 @@ function openMetadataEditor() {
     digitizingEntity: metadata.digitizingEntity ?? null,
   })
   syncDerivedMetadataFields()
+}
+
+function openMetadataEditor() {
+  fillMetadataFormFromCurrent()
   metadataDialogVisible.value = true
 }
 
@@ -914,12 +968,17 @@ async function closeCurrentTask() {
     current.value = null
     image.value = null
     selectedImageIds.value = []
-    await router.push('/qc/my-tasks')
+    await router.push('/qc/tasks')
   } catch (error) {
     await handleVersionOrActionError(error)
   } finally {
     actionLoading.value = false
   }
+}
+
+async function returnToQcTasks() {
+  clearCurrentTask()
+  await router.push('/qc/tasks')
 }
 
 function displayValue(value: unknown) {
@@ -943,6 +1002,13 @@ watch(
   () => route.fullPath,
   () => {
     void refreshForRoute()
+  },
+)
+
+watch(
+  () => current.value?.id,
+  () => {
+    fillMetadataFormFromCurrent()
   },
 )
 
@@ -995,6 +1061,236 @@ onBeforeUnmount(() => {
         </el-table-column>
       </el-table>
     </section>
+
+    <div v-else-if="active === 'mine'" class="qc-desk" :class="{ 'qc-desk--compact': isWorkbenchRoute }">
+      <template v-if="current">
+        <header class="qc-desk-header">
+          <el-button class="qc-back-button" :icon="'ArrowLeft'" :loading="actionLoading" @click="returnToQcTasks">
+            {{ t('common.back') }}
+          </el-button>
+          <div class="qc-project-title">
+            <strong>{{ current.metadata.folderName }}</strong>
+            <span v-if="image">{{ image.filename }}</span>
+          </div>
+          <div v-if="current.status === 'reviewing'" class="qc-primary-actions">
+            <el-button :icon="'Close'" :loading="actionLoading" @click="closeCurrentTask">
+              {{ t('common.close') }}
+            </el-button>
+            <el-button type="danger" :icon="'Close'" :loading="actionLoading" @click="openRejectDialog">
+              {{ t('qc.reject') }}
+            </el-button>
+            <el-button type="success" :icon="'Check'" :loading="actionLoading" :disabled="!current.imageAvailable" @click="approve">
+              {{ t('qc.pass') }}
+            </el-button>
+          </div>
+        </header>
+
+        <aside v-loading="loading" class="qc-image-rail">
+          <div class="qc-rail-summary">
+            <div>
+              <span>{{ t('qc.imageList') }}</span>
+              <strong>{{ current.imageCount }} {{ t('qc.images') }}</strong>
+            </div>
+            <div v-if="current.status === 'reviewing'" class="qc-batch-tools">
+              <span>{{ t('qc.batchSelected') }} {{ batchSelectionLabel }}</span>
+              <div>
+                <el-button size="small" link :disabled="!batchableImageIds.length" @click="selectAllBatchImages">
+                  {{ t('qc.selectAllImages') }}
+                </el-button>
+                <el-button size="small" link :disabled="!selectedBatchIds.length" @click="clearBatchSelection">
+                  {{ t('qc.clearImageSelection') }}
+                </el-button>
+              </div>
+            </div>
+          </div>
+
+          <div class="qc-thumbnail-list">
+            <button
+              v-for="(item, index) in current.images"
+              :key="item.id"
+              type="button"
+              class="qc-thumbnail"
+              :class="{ active: image?.id === item.id, selected: selectedBatchIds.includes(item.id), unavailable: !item.available }"
+              :title="item.filename"
+              @click="image = item"
+            >
+              <el-checkbox
+                v-if="current.status === 'reviewing'"
+                class="qc-thumbnail-check"
+                :model-value="selectedBatchIds.includes(item.id)"
+                :disabled="!item.available"
+                @click.stop
+                @change="(checked: boolean) => toggleImageSelection(item.id, checked)"
+              />
+              <span class="qc-thumbnail-index">{{ String(index + 1).padStart(2, '0') }}</span>
+              <span class="qc-thumbnail-preview">
+                <el-icon v-if="!item.available"><WarningFilled /></el-icon>
+                <el-icon v-else><Document /></el-icon>
+              </span>
+              <span class="qc-thumbnail-name">{{ item.filename }}</span>
+              <span v-if="current.draftImageIds.includes(item.id)" class="qc-draft-flag">{{ t('qc.draftUnsaved') }}</span>
+              <span v-if="item.draftState" class="qc-draft-state">{{ item.draftState }}</span>
+              <el-button
+                v-if="current.status === 'reviewing' && separationMode"
+                class="qc-separation-dot"
+                size="small"
+                :type="item.separationStart ? 'warning' : 'default'"
+                circle
+                @click.stop="toggleSeparationMarker(item.id)"
+              >
+                S
+              </el-button>
+            </button>
+          </div>
+        </aside>
+
+        <section v-loading="detailLoading || previewLoading" class="qc-preview-stage">
+          <template v-if="image">
+            <div class="qc-preview-canvas">
+              <img v-if="previewSrc" class="qc-main-image" :src="previewSrc" :alt="image.filename" @click="openViewer" />
+              <el-alert v-else-if="!image.available" type="error" :closable="false" :title="t('qc.imageMissing')" />
+              <span v-else-if="previewError" class="error-message">{{ previewError }}</span>
+            </div>
+            <button
+              v-if="currentImageIndex > 1"
+              class="qc-nav-button qc-nav-button--prev"
+              @click="image = current.images[currentImageIndex - 2]"
+              :title="t('common.previous')"
+            >
+              <el-icon><ArrowLeft /></el-icon>
+            </button>
+            <button
+              v-if="currentImageIndex < current.imageCount"
+              class="qc-nav-button qc-nav-button--next"
+              @click="image = current.images[currentImageIndex]"
+              :title="t('common.next')"
+            >
+              <el-icon><ArrowRight /></el-icon>
+            </button>
+          </template>
+          <el-empty v-else :description="t('qc.selectImage')" />
+        </section>
+
+        <aside class="qc-review-panel">
+          <section class="qc-comment-card">
+            <div class="qc-comment-box">
+              <p>{{ t('qc.rejectReason') }}</p>
+              <span>{{ t('qc.selectRejectedImages') }}</span>
+              <el-input
+                v-if="current.status === 'reviewing' && image"
+                v-model="currentRejectReason"
+                type="textarea"
+                :rows="4"
+                maxlength="10000"
+                show-word-limit
+                resize="vertical"
+              />
+              <span v-else>{{ t('qc.selectImage') }}</span>
+            </div>
+            <div v-if="current.status === 'reviewing'" class="qc-draft-actions">
+              <span v-if="current.hasDraft" class="draft-status">{{ t('qc.draftUnsaved') }}</span>
+              <el-button type="success" :icon="'Finished'" :loading="draftSaving" :disabled="!current.hasDraft" @click="saveDraft">
+                {{ t('qc.saveDraft') }}
+              </el-button>
+              <el-button :icon="'Delete'" :loading="draftDiscarding" :disabled="!current.hasDraft" @click="discardDraft">
+                {{ t('qc.discardDraft') }}
+              </el-button>
+            </div>
+          </section>
+
+          <section class="qc-info-card">
+            <div class="qc-panel-heading">
+              <span>{{ t('qc.metadata') }}</span>
+              <strong>{{ current.metadata.folderName }}</strong>
+            </div>
+            <el-form
+              :model="metadataForm"
+              label-position="top"
+              class="qc-inline-metadata-form"
+              :disabled="current.status !== 'reviewing' || metadataSaving"
+            >
+              <el-form-item
+                v-for="field in editableTemplateFields"
+                :key="field.key"
+                :label="field.label"
+                :required="field.mandatory"
+              >
+                <el-select
+                  v-if="field.input === 'select'"
+                  v-model="metadataForm[field.key]"
+                  clearable
+                  filterable
+                  style="width: 100%"
+                  @change="syncDerivedMetadataFields"
+                >
+                  <el-option
+                    v-for="option in field.options"
+                    :key="option"
+                    :label="displayOption(option)"
+                    :value="optionValue(field, option)"
+                  />
+                </el-select>
+                <el-input v-else-if="field.input === 'fixed'" :model-value="field.value || ''" readonly />
+                <el-input v-else v-model="metadataForm[field.key]" @input="syncDerivedMetadataFields" />
+              </el-form-item>
+              <el-form-item :label="t('qc.fields.recordType')">
+                <el-input v-model="metadataForm.recordType" readonly />
+              </el-form-item>
+            </el-form>
+            <div v-if="current.status === 'reviewing'" class="qc-inline-metadata-actions">
+              <el-button
+                :type="metadataDirty ? 'primary' : 'info'"
+                :loading="metadataSaving"
+                :disabled="!metadataDirty"
+                @click="saveMetadata"
+              >
+                {{ metadataDirty ? t('common.save') : t('common.saved') }}
+              </el-button>
+            </div>
+          </section>
+        </aside>
+
+        <footer class="qc-tool-strip">
+          <input ref="replaceInputEl" class="hidden-file-input" type="file" accept=".tif,.tiff" @change="handleReplaceUpload" />
+          <input ref="insertInputEl" class="hidden-file-input" type="file" accept=".tif,.tiff" @change="handleInsertUpload" />
+          <div class="qc-tool-row">
+            <template v-if="current.status === 'reviewing'">
+              <el-button :icon="'Upload'" :loading="actionLoading" @click="triggerReplaceUpload">{{ t('qc.replaceImage') }}</el-button>
+              <el-button :icon="'Plus'" :loading="actionLoading" @click="triggerInsertUpload">{{ t('qc.insertBefore') }}</el-button>
+              <el-button :icon="'Delete'" :loading="actionLoading" @click="deleteCurrentImage">{{ t('common.delete') }}</el-button>
+              <el-button v-if="image?.available" :icon="'Crop'" @click="openCropDialog">{{ t('qc.cropImage') }}</el-button>
+              <el-button :icon="'RefreshLeft'" :loading="actionLoading" @click="rotateCurrent(-90)">{{ t('qc.rotateLeft') }}</el-button>
+              <el-button :icon="'RefreshRight'" :loading="actionLoading" @click="rotateCurrent(90)">{{ t('qc.rotateRight') }}</el-button>
+              <el-button :icon="'ArrowUp'" :loading="actionLoading" @click="moveCurrentImage(-1)">{{ t('qc.moveUp') }}</el-button>
+              <el-button :icon="'ArrowDown'" :loading="actionLoading" @click="moveCurrentImage(1)">{{ t('qc.moveDown') }}</el-button>
+              <el-button :loading="actionLoading" @click="undoDraftAction">{{ t('qc.undo') }}</el-button>
+              <el-button :loading="actionLoading" @click="redoDraftAction">{{ t('qc.redo') }}</el-button>
+              <el-popover
+                v-model:visible="showMoreImageTools"
+                placement="top-start"
+                trigger="click"
+                :width="360"
+                popper-class="qc-tool-popover"
+              >
+                <div class="qc-more-tool-grid">
+                  <el-button :icon="'Operation'" :loading="actionLoading" @click="rotateSelectedBatch(90)">{{ t('qc.batchRotate') }}</el-button>
+                  <el-button :loading="actionLoading" @click="deskewCurrent(-1)">{{ t('qc.deskewMinus') }}</el-button>
+                  <el-button :loading="actionLoading" @click="deskewCurrent(1)">{{ t('qc.deskewPlus') }}</el-button>
+                  <el-button :type="separationMode ? 'warning' : 'default'" @click="separationMode = !separationMode">{{ t('qc.separationMode') }}</el-button>
+                  <el-button :loading="actionLoading" @click="restoreCurrentImage">{{ t('qc.restoreOriginal') }}</el-button>
+                  <el-button v-if="image?.available" :icon="'Sunny'" :loading="luminanceLoading" @click="applyLuminanceToCurrent">{{ t('qc.luminance') }}</el-button>
+                  <el-button :icon="'Operation'" :loading="luminanceLoading" @click="applyLuminanceBatch">{{ t('qc.batchLuminance') }}</el-button>
+                </div>
+                <template #reference>
+                  <el-button :icon="'MoreFilled'">{{ t('common.more') }}</el-button>
+                </template>
+              </el-popover>
+            </template>
+          </div>
+        </footer>
+      </template>
+      <el-empty v-else :description="t('qc.noMineTask')" />
+    </div>
 
     <div v-else-if="active === 'mine'" class="qc-workbench-redesign" :class="{ 'qc-workbench-redesign--compact': isWorkbenchRoute }">
       <!-- 左侧缩略图侧边栏（可折叠） -->
@@ -3616,6 +3912,935 @@ onBeforeUnmount(() => {
 .muted {
   color: var(--el-text-color-secondary);
   font-size: 13px;
+}
+
+.qc-desk {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(170px, 210px) minmax(0, 1fr) minmax(290px, 340px);
+  grid-template-rows: 58px minmax(0, 1fr) auto;
+  height: calc(100vh - 236px);
+  max-height: calc(100vh - 236px);
+  min-height: 620px;
+  overflow: hidden;
+  border: 1px solid #d5dbd7;
+  background: #eef1ef;
+}
+
+.qc-desk--compact {
+  height: 100vh;
+  max-height: 100vh;
+  min-height: 0;
+}
+
+.qc-desk-header {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  display: grid;
+  grid-template-columns: minmax(140px, 170px) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #d5dbd7;
+  background: #f7f8f6;
+}
+
+.qc-back-button {
+  justify-content: flex-start;
+  height: 40px;
+  border-radius: 4px;
+  font-weight: 700;
+}
+
+.qc-project-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.qc-project-title strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #1a3329;
+  font-size: 17px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qc-project-title span {
+  min-width: 0;
+  overflow: hidden;
+  color: #607267;
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qc-primary-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.qc-primary-actions :deep(.el-button) {
+  height: 38px;
+  min-width: 84px;
+  margin: 0;
+  border-radius: 4px;
+  font-weight: 800;
+}
+
+.qc-image-rail {
+  grid-column: 1;
+  grid-row: 2 / 4;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-right: 1px solid #d5dbd7;
+  background: #f7f8f6;
+}
+
+.qc-rail-summary {
+  flex: 0 0 auto;
+  display: grid;
+  gap: 10px;
+  padding: 12px 10px;
+  border-bottom: 1px solid #d5dbd7;
+}
+
+.qc-rail-summary > div:first-child {
+  display: grid;
+  gap: 4px;
+}
+
+.qc-rail-summary span {
+  color: #607267;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.qc-rail-summary strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #2c5f4f;
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qc-batch-tools {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border: 1px solid #d5dbd7;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.qc-batch-tools div {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.qc-thumbnail-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+.qc-thumbnail {
+  position: relative;
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 30px;
+  grid-template-rows: 54px auto;
+  gap: 6px 8px;
+  width: 100%;
+  min-height: 92px;
+  padding: 8px;
+  border: 2px solid transparent;
+  border-radius: 6px;
+  background: #ffffff;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.qc-thumbnail:hover,
+.qc-thumbnail.active {
+  border-color: #2c5f4f;
+  background: #f4f8f6;
+  box-shadow: 0 2px 8px rgba(44, 95, 79, 0.14);
+}
+
+.qc-thumbnail.selected {
+  box-shadow: inset 0 0 0 1px #2c5f4f, 0 2px 8px rgba(44, 95, 79, 0.14);
+}
+
+.qc-thumbnail.unavailable {
+  opacity: 0.56;
+  background: #fff5f5;
+}
+
+.qc-thumbnail-check {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: start;
+  justify-self: start;
+  z-index: 2;
+  display: inline-flex;
+  width: 24px;
+  height: 24px;
+  padding-left: 2px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 1px 4px rgba(26, 51, 41, 0.16);
+}
+
+.qc-thumbnail-check :deep(.el-checkbox__label) {
+  display: none;
+}
+
+.qc-thumbnail-index {
+  grid-column: 3;
+  grid-row: 1;
+  align-self: start;
+  justify-self: end;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #4d7769;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.qc-thumbnail-preview {
+  grid-column: 2;
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 54px;
+  border-radius: 5px;
+  background: #f0f2f1;
+  color: #9d90b8;
+  font-size: 24px;
+}
+
+.qc-thumbnail-name {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  min-width: 0;
+  overflow: hidden;
+  color: #607267;
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qc-draft-flag,
+.qc-draft-state {
+  position: absolute;
+  z-index: 3;
+  right: 8px;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 800;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.qc-draft-flag {
+  bottom: 28px;
+  background: #fff7e6;
+  color: #b76e00;
+}
+
+.qc-draft-state {
+  left: 8px;
+  right: auto;
+  bottom: 28px;
+  background: #e8f3ef;
+  color: #2c5f4f;
+}
+
+.qc-separation-dot {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 4;
+}
+
+.qc-preview-stage {
+  grid-column: 2;
+  grid-row: 2;
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #eef1ef;
+}
+
+.qc-preview-canvas {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px 24px 18px;
+}
+
+.qc-main-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 4px;
+  box-shadow: 0 10px 30px rgba(18, 40, 31, 0.22);
+  cursor: zoom-in;
+}
+
+.qc-nav-button {
+  position: absolute;
+  top: 50%;
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 48px;
+  height: 48px;
+  border: none;
+  border-radius: 50%;
+  background: #477262;
+  color: #ffffff;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(18, 40, 31, 0.24);
+  transform: translateY(-50%);
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.qc-nav-button:hover {
+  background: #2c5f4f;
+  transform: translateY(-50%) scale(1.06);
+}
+
+.qc-nav-button--prev {
+  left: 18px;
+}
+
+.qc-nav-button--next {
+  right: 18px;
+}
+
+.qc-review-panel {
+  grid-column: 3;
+  grid-row: 2 / 4;
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  overflow: hidden;
+  border-left: 1px solid #d5dbd7;
+  background: #f7f8f6;
+}
+
+.qc-comment-card,
+.qc-info-card {
+  min-width: 0;
+  overflow: hidden;
+  background: #f7f8f6;
+}
+
+.qc-comment-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border-bottom: 1px solid #d5dbd7;
+}
+
+.qc-info-card {
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  overflow-y: auto;
+}
+
+.qc-panel-heading {
+  display: grid;
+  gap: 4px;
+}
+
+.qc-panel-heading span {
+  color: #607267;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+}
+
+.qc-panel-heading strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #1a3329;
+  font-size: 15px;
+  font-weight: 800;
+}
+
+.qc-comment-box {
+  display: grid;
+  gap: 8px;
+  min-height: 112px;
+  padding: 10px;
+  border: 1px solid #d5dbd7;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.qc-comment-box p {
+  margin: 0;
+  color: #1a3329;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.qc-comment-box span {
+  color: #607267;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.qc-comment-box :deep(.el-textarea__inner) {
+  min-height: 96px;
+  border-radius: 4px;
+  color: #1a3329;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.qc-draft-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.qc-draft-actions :deep(.el-button),
+.qc-comment-box :deep(.el-button),
+.qc-edit-metadata {
+  margin: 0;
+  border-radius: 4px;
+  font-weight: 700;
+}
+
+.qc-edit-metadata {
+  width: 100%;
+  min-height: 38px;
+}
+
+.qc-inline-metadata-form {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.qc-inline-metadata-form :deep(.el-form-item) {
+  margin-bottom: 0;
+}
+
+.qc-inline-metadata-form :deep(.el-form-item__label) {
+  margin-bottom: 4px;
+  color: #607267;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
+.qc-inline-metadata-form :deep(.el-input__wrapper),
+.qc-inline-metadata-form :deep(.el-select__wrapper) {
+  min-height: 34px;
+  border-radius: 4px;
+}
+
+.qc-inline-metadata-form :deep(.el-input__inner),
+.qc-inline-metadata-form :deep(.el-select__placeholder) {
+  min-width: 0;
+  color: #1a3329;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.qc-inline-metadata-actions {
+  position: sticky;
+  bottom: -12px;
+  z-index: 2;
+  display: flex;
+  justify-content: flex-end;
+  padding: 10px 0 0;
+  border-top: 1px solid #d5dbd7;
+  background: #f7f8f6;
+}
+
+.qc-inline-metadata-actions :deep(.el-button) {
+  min-width: 92px;
+  margin: 0;
+  border-radius: 4px;
+  font-weight: 800;
+}
+
+.qc-metadata-summary {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #d5dbd7;
+  border-radius: 4px;
+  background: #eef1ef;
+}
+
+.qc-metadata-summary div {
+  display: grid;
+  gap: 3px;
+}
+
+.qc-metadata-summary span {
+  color: #607267;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.qc-metadata-summary strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #1a3329;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.qc-metadata-details {
+  border: 1px solid #d5dbd7;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.qc-metadata-details summary {
+  padding: 9px 10px;
+  border-bottom: 1px solid #d5dbd7;
+  background: #eef1ef;
+  color: #2c5f4f;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.qc-metadata-group {
+  padding: 10px;
+  border-bottom: 1px solid #e5e9e6;
+}
+
+.qc-metadata-group:last-child {
+  border-bottom: none;
+}
+
+.qc-metadata-group h4 {
+  margin: 0 0 8px;
+  color: #2c5f4f;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.qc-metadata-group dl {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+}
+
+.qc-metadata-group dl div {
+  display: grid;
+  grid-template-columns: minmax(72px, 0.42fr) minmax(0, 0.58fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.qc-metadata-group dt {
+  color: #607267;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.qc-metadata-group dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: #1a3329;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.qc-tool-strip {
+  grid-column: 2;
+  grid-row: 3;
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+  min-height: 58px;
+  padding: 10px 14px;
+  overflow: visible;
+  border-top: 2px solid #2c5f4f;
+  background: #f7f8f6;
+}
+
+.qc-tool-row {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.qc-tool-strip :deep(.el-button) {
+  flex: 0 0 auto;
+  height: 38px;
+  margin: 0;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+:global(.qc-tool-popover) {
+  border-color: var(--lw-line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 18px 50px rgba(19, 48, 32, 0.12);
+}
+
+:global(.qc-tool-popover .qc-more-tool-grid) {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+:global(.qc-tool-popover .el-button) {
+  width: 100%;
+  height: 36px;
+  margin: 0;
+  border-radius: 6px;
+  color: var(--lw-dark);
+  font-weight: 800;
+}
+
+.qc-desk {
+  border-color: var(--lw-line);
+  background:
+    linear-gradient(180deg, rgba(245, 238, 219, 0.72) 0, rgba(249, 247, 247, 0.98) 180px),
+    var(--lw-sea-salt);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72);
+}
+
+.qc-desk-header,
+.qc-image-rail,
+.qc-review-panel,
+.qc-comment-card,
+.qc-info-card,
+.qc-tool-strip,
+.qc-inline-metadata-actions {
+  border-color: var(--lw-line);
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.qc-desk-header {
+  background: rgba(245, 238, 219, 0.9);
+}
+
+.qc-project-title strong,
+.qc-panel-heading strong,
+.qc-comment-box p,
+.qc-metadata-summary strong,
+.qc-metadata-group dd,
+.qc-inline-metadata-form :deep(.el-input__inner),
+.qc-inline-metadata-form :deep(.el-select__placeholder) {
+  color: var(--lw-dark);
+}
+
+.qc-project-title span,
+.qc-rail-summary span,
+.qc-thumbnail-name,
+.qc-panel-heading span,
+.qc-comment-box span,
+.qc-inline-metadata-form :deep(.el-form-item__label),
+.qc-metadata-summary span,
+.qc-metadata-group dt {
+  color: var(--lw-muted);
+}
+
+.qc-rail-summary strong,
+.qc-metadata-details summary,
+.qc-metadata-group h4 {
+  color: var(--lw-green);
+}
+
+.qc-back-button.el-button,
+.qc-primary-actions :deep(.el-button),
+.qc-tool-strip :deep(.el-button),
+.qc-inline-metadata-actions :deep(.el-button),
+.qc-draft-actions :deep(.el-button) {
+  border-radius: 6px;
+}
+
+.qc-back-button.el-button {
+  border-color: var(--lw-line);
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--lw-dark);
+  box-shadow: 0 8px 18px rgba(19, 48, 32, 0.06);
+}
+
+.qc-back-button.el-button:hover,
+.qc-back-button.el-button:focus {
+  border-color: var(--lw-line-strong);
+  background: var(--lw-sea-salt);
+  color: var(--lw-green);
+}
+
+.qc-batch-tools,
+.qc-thumbnail,
+.qc-comment-box,
+.qc-metadata-summary,
+.qc-metadata-details,
+.qc-inline-metadata-form :deep(.el-input__wrapper),
+.qc-inline-metadata-form :deep(.el-select__wrapper),
+.qc-comment-box :deep(.el-textarea__inner) {
+  border-color: var(--lw-line);
+  background: var(--lw-white);
+  box-shadow: 0 8px 22px rgba(19, 48, 32, 0.035);
+}
+
+.qc-thumbnail:hover,
+.qc-thumbnail.active {
+  border-color: var(--lw-green);
+  background: rgba(4, 98, 65, 0.06);
+  box-shadow: 0 10px 24px rgba(19, 48, 32, 0.09);
+}
+
+.qc-thumbnail.selected {
+  box-shadow: inset 0 0 0 1px var(--lw-green), 0 10px 24px rgba(19, 48, 32, 0.09);
+}
+
+.qc-thumbnail-index,
+.qc-nav-button {
+  background: var(--lw-green);
+  color: var(--lw-white);
+}
+
+.qc-nav-button {
+  box-shadow: 0 10px 24px rgba(19, 48, 32, 0.16);
+}
+
+.qc-nav-button:hover {
+  background: #034b32;
+}
+
+.qc-thumbnail-preview,
+.qc-metadata-summary,
+.qc-metadata-details summary {
+  background: var(--lw-sea-salt);
+}
+
+.qc-draft-flag {
+  background: var(--lw-saffron-soft);
+  color: var(--lw-dark);
+}
+
+.qc-draft-state {
+  background: var(--lw-green-soft);
+  color: var(--lw-green);
+}
+
+.qc-thumbnail.unavailable {
+  background: var(--lw-danger-soft);
+}
+
+.qc-preview-stage {
+  background:
+    linear-gradient(180deg, rgba(249, 247, 247, 0.92), rgba(255, 255, 255, 0.78)),
+    var(--lw-sea-salt);
+}
+
+.qc-main-image {
+  border-radius: 6px;
+  box-shadow: 0 18px 50px rgba(19, 48, 32, 0.16);
+}
+
+.qc-tool-strip {
+  border-top-color: var(--lw-green);
+}
+
+.qc-primary-actions :deep(.el-button--success),
+.qc-inline-metadata-actions :deep(.el-button--primary:not(.is-disabled)) {
+  --el-button-bg-color: var(--lw-green);
+  --el-button-border-color: var(--lw-green);
+  --el-button-hover-bg-color: #034b32;
+  --el-button-hover-border-color: #034b32;
+  --el-button-active-bg-color: #034b32;
+  --el-button-active-border-color: #034b32;
+}
+
+.qc-primary-actions :deep(.el-button--danger) {
+  --el-button-bg-color: var(--lw-danger);
+  --el-button-border-color: var(--lw-danger);
+  --el-button-hover-bg-color: #c84c3b;
+  --el-button-hover-border-color: #c84c3b;
+}
+
+.qc-tool-strip :deep(.el-button:not(.el-button--primary):not(.el-button--danger):not(.el-button--success)),
+.qc-draft-actions :deep(.el-button:not(.el-button--primary):not(.el-button--danger):not(.el-button--success)) {
+  background: rgba(255, 255, 255, 0.78);
+  color: var(--lw-dark);
+}
+
+.qc-tool-strip :deep(.el-button:not(.el-button--primary):not(.el-button--danger):not(.el-button--success):hover),
+.qc-draft-actions :deep(.el-button:not(.el-button--primary):not(.el-button--danger):not(.el-button--success):hover) {
+  border-color: var(--lw-saffron);
+  background: var(--lw-saffron-soft);
+  color: var(--lw-dark);
+}
+
+@media (min-width: 1920px) {
+  .qc-desk {
+    grid-template-columns: minmax(190px, 230px) minmax(0, 1fr) minmax(320px, 360px);
+  }
+}
+
+@media (max-width: 1440px) {
+  .qc-desk {
+    grid-template-columns: 180px minmax(0, 1fr) 286px;
+  }
+
+  .qc-project-title span {
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 1200px) {
+  .qc-desk {
+    grid-template-columns: 160px minmax(0, 1fr) 250px;
+  }
+
+  .qc-primary-actions :deep(.el-button) {
+    min-width: 72px;
+    padding: 0 10px;
+  }
+}
+
+@media (max-width: 1024px) {
+  .qc-desk,
+  .qc-desk--compact {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto minmax(420px, 1fr) auto auto;
+    height: auto;
+    max-height: none;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .qc-desk-header {
+    grid-column: 1;
+    grid-row: 1;
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .qc-project-title,
+  .qc-primary-actions {
+    justify-content: center;
+  }
+
+  .qc-image-rail {
+    grid-column: 1;
+    grid-row: 2;
+    border-right: none;
+    border-bottom: 1px solid #d5dbd7;
+  }
+
+  .qc-thumbnail-list {
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+
+  .qc-thumbnail {
+    width: 150px;
+    flex: 0 0 150px;
+  }
+
+  .qc-preview-stage {
+    grid-column: 1;
+    grid-row: 3;
+    min-height: 420px;
+  }
+
+  .qc-tool-strip {
+    grid-column: 1;
+    grid-row: 4;
+  }
+
+  .qc-review-panel {
+    grid-column: 1;
+    grid-row: 5;
+    grid-template-rows: auto auto;
+    border-left: none;
+    border-top: 1px solid #d5dbd7;
+    overflow: visible;
+  }
+}
+
+@media (max-width: 640px) {
+  .qc-desk-header {
+    padding: 8px;
+  }
+
+  .qc-project-title {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .qc-primary-actions {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .qc-primary-actions :deep(.el-button) {
+    width: 100%;
+  }
+
+  .qc-preview-canvas {
+    padding: 12px;
+  }
+
+  .qc-nav-button {
+    width: 40px;
+    height: 40px;
+  }
+
+  .qc-metadata-group dl div {
+    grid-template-columns: 1fr;
+    gap: 3px;
+  }
 }
 
 :deep(.el-loading-spinner) {

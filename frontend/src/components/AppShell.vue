@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { translateValue, useAppLocale } from '@/i18n'
 import { useAuthStore } from '@/stores/auth'
 import logo from '@/assets/lifewood-logo.jpg'
 
 const auth = useAuthStore()
+const route = useRoute()
 const router = useRouter()
 const { t } = useI18n()
 const { locale, toggleLocale } = useAppLocale()
@@ -27,6 +28,8 @@ const navItems = computed(() => {
   ]
 })
 
+const immersiveQc = computed(() => route.name === 'qc-my-tasks' || route.name === 'qc-review')
+
 function logout() {
   auth.clear()
   router.push('/login')
@@ -34,8 +37,8 @@ function logout() {
 </script>
 
 <template>
-  <div class="shell">
-    <aside class="sidebar">
+  <div class="shell" :class="{ 'shell--immersive': immersiveQc }">
+    <aside v-if="!immersiveQc" class="sidebar">
       <div class="brand-mini">
         <img :src="logo" alt="lifewood" />
       </div>
@@ -48,7 +51,7 @@ function logout() {
     </aside>
 
     <main class="main">
-      <header class="topbar">
+      <header v-if="!immersiveQc" class="topbar">
         <div>
           <strong>{{ auth.user?.userId }}</strong>
           <span class="muted"> / {{ translateValue('roles', auth.user?.role) }}</span>

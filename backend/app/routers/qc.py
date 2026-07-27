@@ -9,6 +9,7 @@ from fastapi import APIRouter, File, Form, Query, UploadFile
 from fastapi.responses import FileResponse
 from PIL import Image, ImageOps, UnidentifiedImageError
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import object_session
 
 from app.core.errors import ApiCodes, BusinessError
@@ -905,6 +906,24 @@ def get_detail(folder_id: int, current_user: QcUser, db: DbSession) -> ApiRespon
 @router.post("/{folder_id}/claim", response_model=ApiResponse[MetadataQcTaskVO])
 def claim_task(folder_id: int, current_user: QcUser, db: DbSession) -> ApiResponse[MetadataQcTaskVO]:
     """领取指定 Folder。"""
+    project_ids = project_ids_for_user(db, current_user.id)
+    if not project_ids:
+        raise BusinessError(ApiCodes.NOT_FOUND, "暂无可领取的QC任务", 404)
+
+    existing = db.scalar(
+        select(CaptureFolder)
+        .where(
+            *visible_folder_conditions(project_ids),
+            func.lower(CaptureFolder.qc_status) == "pending",
+            CaptureFolder.qc_locked_by == current_user.user_id,
+            CaptureFolder.id != folder_id,
+        )
+        .order_by(CaptureFolder.qc_locked_at.desc().nullslast(), CaptureFolder.id.asc())
+        .limit(1)
+    )
+    if existing:
+        raise BusinessError(ApiCodes.CONFLICT, "当前已有领取任务，请先完成当前任务", 409)
+
     folder = folder_or_404(db, folder_id, current_user.id, lock=True)
 
     # Already claimed by this user?
@@ -924,7 +943,11 @@ def claim_task(folder_id: int, current_user: QcUser, db: DbSession) -> ApiRespon
 
     folder.qc_locked_by = current_user.user_id
     folder.qc_locked_at = now()
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as error:
+        db.rollback()
+        raise BusinessError(ApiCodes.CONFLICT, "当前已有领取任务，请先完成当前任务", 409) from error
     write_qc_audit("claim", current_user.user_id, folder.id, result="success")
 
     return ok(to_task_vo(db, folder_or_404(db, folder_id, current_user.id), current_user.user_id))

@@ -177,6 +177,19 @@ textarea {
     var(--lw-sea-salt);
 }
 
+.shell--immersive {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.shell--immersive .main {
+  height: 100vh;
+}
+
+.shell--immersive .content {
+  padding: 0;
+  overflow: hidden;
+}
+
 .sidebar {
   position: sticky;
   top: 0;

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts/core'
@@ -13,7 +13,7 @@ import type { StatsOverview } from '@/types'
 
 echarts.use([TooltipComponent, LegendComponent, PieChart, CanvasRenderer])
 
-const { t } = useI18n()
+const { t, locale } = useI18n()
 const loading = ref(false)
 const chartRef = ref<HTMLDivElement | null>(null)
 let chart: echarts.ECharts | null = null
@@ -30,10 +30,13 @@ const stats = ref<StatsOverview>({
 })
 
 const statusDistribution = computed(() =>
-  stats.value.taskStatusDistribution.map((item) => ({
-    name: translateValue('metadataQcStatus', item.status || item.label),
-    value: item.count,
-  })),
+  {
+    void locale.value
+    return stats.value.taskStatusDistribution.map((item) => ({
+      name: translateValue('metadataQcStatus', item.status || item.label),
+      value: item.count,
+    }))
+  },
 )
 
 async function load() {
@@ -72,6 +75,10 @@ function renderChart() {
 function resizeChart() {
   chart?.resize()
 }
+
+watch(locale, () => {
+  void nextTick(() => renderChart())
+})
 
 onMounted(() => {
   load()
