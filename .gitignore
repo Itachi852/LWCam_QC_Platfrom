@@ -15,7 +15,7 @@ backend/.pytest_cache/
 backend/.ruff_cache/
 backend/.mypy_cache/
 backend/.cache/
-
+backend/scripts/
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
