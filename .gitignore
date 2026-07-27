@@ -4,6 +4,10 @@
 .idea/
 .vscode/
 
+shared-images/test-data/
+/scripts/
+/database/
+/docs/
 backend/.venv/
 backend/__pycache__/
 backend/**/*.py[cod]
