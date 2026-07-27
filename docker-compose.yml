@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lwcam-py-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-lwcam}
+      POSTGRES_USER: ${DB_USER:-lwcam}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-lwcam}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - lwcam_py_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-lwcam} -d ${DB_NAME:-lwcam}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    container_name: lwcam-py-backend
+    restart: unless-stopped
+    environment:
+      APP_NAME: LWCam Python Backend
+      APP_ENV: docker
+      APP_DEBUG: "true"
+      API_PREFIX: /api
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-lwcam}
+      DB_USER: ${DB_USER:-lwcam}
+      DB_PASSWORD: ${DB_PASSWORD:-lwcam}
+      JWT_SECRET: ${JWT_SECRET:-lwcam-dev-secret-change-in-production-min-32-chars}
+      JWT_EXPIRE_MINUTES: 480
+    volumes:
+      - ${CAPTURE_IMAGE_HOST_PATH:-./shared-images}:${CAPTURE_IMAGE_CONTAINER_PATH:-/data/shared-images}:ro
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: lwcam-py-frontend
+    restart: unless-stopped
+    environment:
+      VITE_API_TARGET: http://backend:8080
+    ports:
+      - "${FRONTEND_PORT:-5174}:5174"
+    depends_on:
+      - backend
+
+volumes:
+  lwcam_py_pg_data:
+

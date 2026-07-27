@@ -1,0 +1,204 @@
+================================================================================
+ 元数据与导出契约
+ 模块 1（QC）和模块 2（Export）的权威字段、命名、CSV、ZIP 细节
+================================================================================
+
+本文列出 QC 和 Export 模块必须实现的具体数据细节。
+这些内容从 Lifewood 现有元数据/QC/export 设计中提取，目的是给开发团队一份聚焦的实现契约。
+文中值适用于当前项目（WWII Medical Files），应保存在项目模板中
+（projects.template JSONB，由 LWCam Admin 维护），以便按项目配置。
+这些值是示例，不是硬编码。
+
+引用方：
+  MODULE_1_QC_REWORK_DESIGN.txt
+  MODULE_2_EXPORT_DESIGN.txt
+
+--------------------------------------------------------------------------------
+ 1. 元数据模板
+--------------------------------------------------------------------------------
+
+这些字段与 capture_folders 列 1:1 映射，并在 LWCAM Box Mode 的 CAPTURE 阶段录入；
+QC 负责验证并可修正。
+
+用户录入字段：
+
+| Field | Input | Mandatory | Exported |
+|---|---|---|---|
+| Cover_Tag | dropdown | yes | no |
+| Image_Tags | dropdown | no | no（仅一个值） |
+| Title | dropdown | yes | yes |
+| Volume | free text | yes | yes |
+| Start Date | dropdown | yes | yes |
+| End Date | dropdown | yes | yes |
+| Archival Reference Number | free text | no | yes |
+
+下拉值（当前项目，放入 template）：
+
+Cover_Tag:
+  - "Cover Will Be Captured"
+  - "Cover Will not Be Captured"
+  - "Cover Unavailable or Missing"
+
+Image_Tags:
+  - "Faded or Damaged Documents"
+  - "Reflective Surface"
+  - "Document Glued Together"
+
+Title:
+  - "WWI South African Mounted Rifles Military Indexes"
+  - "WWI South African Mounted Rifles Military Personnel Cards"
+  - "WWI Medical Files"
+  - "WWII Medical Files"
+
+Start Date: 1914 | 1939
+End Date:   1918 | 1945
+未来模板可允许完整日期。
+
+固定字段（按项目/template）：
+
+| Field | Value |
+|---|---|
+| Place | South Africa |
+| Language | English |
+| Record Custodian | South Africa Department of Defense |
+| Digitizing Entity | Lifewood |
+| Capture Operator ID | cis.user.MM38-RXW3 |
+| Capture Operator Name | lifewoodza01 |
+
+注意：Capture Operator ID/Name 是 INGEST 操作员身份，见第 6 节说明。
+
+映射字段：Record Type 从 Title 推导，绝不手工录入：
+
+| Title | Record Type |
+|---|---|
+| "WWI South African Mounted Rifles Military Personnel Cards" | "Military Service Records" |
+| "WWI South African Mounted Rifles Military Indexes" | "Military Service Record Indexes" |
+| "WWI Medical Files" | "Military Medical Records" |
+| "WWII Medical Files" | "Military Medical Records" |
+
+规则：
+  draft save 可以缺少必填字段；
+  但 Folder 在所有必填字段存在且有效之前，不允许 approve 到 PASS。
+
+--------------------------------------------------------------------------------
+ 2. 导出 Group ID（命名）
+--------------------------------------------------------------------------------
+
+格式：
+  <ProjectID><LocationCode><UserID><YYMMDD><Sequence6>
+
+示例：
+  M92P-8ZSZA01SAX04260330000001
+
+其中 LocationCode = "ZA01"。
+
+| Segment | Meaning |
+|---|---|
+| ProjectID | ingest project id，例如 M92P-8ZS；这是 project/template 设置。它是 INGEST id，不是 LWCam 的 project_key。 |
+| LocationCode | 项目的合并 country+location code，例如 "ZA01"。它就是 LWCam 的 projects.country_location_code 字段原值；country 和 location 已经合并为一个字段，因此没有单独 CountryCode 段。原样使用。 |
+| UserID | 从排序后的第一张源图片文件名解析，例如 SAX04。 |
+| YYMMDD | 从排序后的第一张源图片文件名解析出的日期。 |
+| Sequence6 | 每项目全局序列，补零到 6 位。使用事务性 PostgreSQL SEQUENCE（每项目一个）。绝不要通过统计已有 ZIP 文件生成。 |
+
+该字符串就是 capture_folders.group_id（VARCHAR(255) UNIQUE）。
+它也会成为 ZIP 文件名，并传给 ingest upload（模块 3），因此这里使用的 ProjectID 和 LocationCode
+必须与上传时使用的 ingest 标识一致。
+
+--------------------------------------------------------------------------------
+ 3. 导出 ZIP 结构
+--------------------------------------------------------------------------------
+
+ZIP 文件名：
+  <GroupID>.zip
+
+内容（文件位于 ZIP 根目录，不要在 ZIP 内再包一层 <GroupID>/ 顶层目录）：
+
+```text
+GroupMetadataImage.csv
+ArtifactMetadata.csv
+artifacts/
+  <GroupID>_Image0001.tif
+  <GroupID>_Image0002.tif
+  ...
+```
+
+Artifacts：
+  每张图片一个 .tif，使用 adobe_deflate 压缩，按 canonical image sequence 排列，
+  索引为 4 位补零。
+
+--------------------------------------------------------------------------------
+ 4. GroupMetadataImage.csv（列顺序必须如下）
+--------------------------------------------------------------------------------
+
+```text
+Rework, Title, Place, Start Date, End Date, Record Type, Language,
+Record Custodian, Archival Reference Number, Capture ID,
+Capture Operator Name, Capture Operator ID, Total Artifacts, Volume,
+Capture Date, Digitizing Entity
+```
+
+规则：
+
+| Column | Rule |
+|---|---|
+| Rework | = capture_folders.client_rework。普通导出为 FALSE；当 Folder 因 CLIENT REWORK（客户端 QC 拒绝）后重新导出时为 TRUE。输出字面量 "TRUE"/"FALSE"，与样例一致。 |
+| Title | 录入元数据。 |
+| Place | 固定值。 |
+| Start Date / End Date | 录入元数据。 |
+| Record Type | 从 Title 映射（第 1 节）。 |
+| Language | 固定值。 |
+| Record Custodian | 固定值。 |
+| Archival Reference Number | 录入元数据（archival_ref_no）。 |
+| Capture ID | Group ID。 |
+| Capture Operator Name/ID | 固定值（见第 6 节说明）。 |
+| Total Artifacts | 最终图片数量。 |
+| Volume | 录入元数据。 |
+| Capture Date | 从排序后的第一张源图片文件名解析。 |
+| Digitizing Entity | 固定值。 |
+
+--------------------------------------------------------------------------------
+ 5. ArtifactMetadata.csv（列顺序必须如下）
+--------------------------------------------------------------------------------
+
+```text
+Filename, File Size, Artifact Type, Hash Algorithm, Hash,
+Image Width, Image Height, Capture ID
+```
+
+规则：
+
+| Column | Rule |
+|---|---|
+| Filename | `<GroupID>_Image0001.tif` 等。 |
+| File Size | 最终 artifact 字节数。 |
+| Artifact Type | `"Image"`。 |
+| Hash Algorithm | `"MD5"`。 |
+| Hash | 最终 .tif artifact 的 MD5。 |
+| Image Width/Height | 最终图片尺寸。 |
+| Capture ID | 不含 ".tif" 的文件名。 |
+
+行按 canonical image sequence 排序；并行处理绝不能改变顺序。
+
+--------------------------------------------------------------------------------
+ 6. 说明 / 待确认项
+--------------------------------------------------------------------------------
+
+- TIF artifacts 使用 adobe_deflate 压缩；在技术允许时保留 color depth / ICC。
+- Hash algorithm 当前契约为 MD5；需确认未来项目是否仍强制 MD5。
+- 首次生产导出前，需要确认 ingest 侧期望的 CSV 编码和换行符。
+- Capture Operator ID/Name：
+  EXPORT CSV 使用项目固定的 ingest 身份
+  （例如 cis.user.MM38-RXW3 / lifewoodza01），不是 LWCAM 的设备操作员。
+  capture_folders.capture_operator_id/name 仍记录真实采集操作员，用于内部追踪。
+  两者都要保留；导出固定 ingest 身份。
+- CLIENT REWORK 与 Rework 列：
+  schema 中的 client-QC 字段驱动该列：
+    client_qc_status（NULL / UNDER REVIEW / APPROVED / REJECTED）
+    client_rework（BOOLEAN，当客户端 QC 站点 CSV 拒绝 Folder 时设为 TRUE）
+  普通首次导出 client_rework=FALSE，因此 Rework="FALSE"。
+  当客户端拒绝的 Folder 完成返工并重新导出时，client_rework=TRUE，因此 Rework="TRUE"。
+  完整 client-rework 重新导入流程（导入客户端 rejection CSV 并重新打开 Folder）是后续阶段；
+  但 Export 模块必须已经读取 client_rework，并据此输出 Rework 列，
+  这样该阶段落地后重导出才是正确的。
+  这些 client-QC 字段归 client-rework 阶段所有；QC/Export 不创造它们的值，
+  此处只读取 client_rework。

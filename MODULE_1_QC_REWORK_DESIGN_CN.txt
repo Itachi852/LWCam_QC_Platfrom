@@ -1,0 +1,304 @@
+================================================================================
+ 模块 1 - QC + 图片修复 + 返工
+ 面向接手开发团队的设计指南与需求说明
+================================================================================
+
+状态：   从零开始建设（需要 QC 审核界面）。
+运行于： LWCAM（Flutter Windows 桌面端），作为每个工位可开关的阶段，
+        由 NodeConfig.qcEnabled 控制（该开关已存在于 Station Setup 中）。
+
+核心原则（保持逻辑简单）：
+    REJECT = 该页面必须重新实体拍摄。
+    其他所有问题都在 QC 内修复，随后 Folder 通过审核。
+
+不要设计复杂的多状态返工流水线。审核员在 QC 页面中修复所有可修复问题
+（裁剪、纠偏、旋转、亮度修复、元数据、拆分、删除、替换、重排），然后通过。
+只有一种情况需要把 Folder 打回：一张或多张图片需要重新拍摄。
+
+优先阅读：
+    ../ARCHITECTURE.md（流水线与字段归属）
+    METADATA_AND_EXPORT_CONTRACT.txt（QC 需要验证的元数据字段）
+    LWCAM/TECHNICAL_DOCUMENTATION.md（同步 outbox、采集完整性）
+    Luminance Correction/（QC 集成的图片修复工具）
+
+--------------------------------------------------------------------------------
+ 1. 在流水线中的位置
+--------------------------------------------------------------------------------
+
+采集 -> 传输 -> 图片处理（LWIP）之后，一个 Folder 会进入以下状态：
+  qc_status='PENDING'
+  is_deskewed/is_cropped/is_created_thumbnail=TRUE
+  folder_path + thumbnail_path 已设置
+  group_id=NULL
+
+QC 是下一阶段。审核员在启用 qcEnabled 的工位上打开 PENDING Folder，审核页面，
+然后执行以下二选一：
+  - APPROVE（可先进行内联修复）
+      -> qc_status='PASS'
+      -> 进入 Export（模块 2）的候选范围。
+  - REJECT（某页面需要重新拍摄）
+      -> qc_status='REWORK'
+      -> 进入重拍闭环（第 6 节）
+      -> 回到 PENDING
+      -> 重新审核。
+
+一个 “task” 等于一个 capture_folder。
+一个 “page” 等于一条 capture_images 记录。
+任务从数据库发现，不从 NAS 重新导入：QC 读取 qc_status='PENDING' 的
+capture_folders。预览从 folder_path/thumbnail_path 提供。
+
+--------------------------------------------------------------------------------
+ 2. 数据模型 - 使用现有 schema，不新增表
+--------------------------------------------------------------------------------
+
+共享 schema 已经包含 QC 所需的一切（见 LWCam_database SQL 和 ARCHITECTURE.md
+第 4 节）。不要新增 QC 专用表。
+
+  capture_folders    “任务”。
+     qc_status        PENDING | PASS | REWORK（QC 判定/状态）
+     group_id         导出身份；导出模块生成前保持 NULL（模块 2）
+     is_deskewed / is_cropped / is_created_thumbnail / folder_path /
+       thumbnail_path   图片处理结果；当 QC 因重拍而 reject 时，会把三个处理标记
+       重置为 FALSE（第 6 节），这样 Folder 返回后会重新处理。
+     metadata columns（cover_tag、title、volume、dates、archival_ref_no 等）
+       QC 可在界面中直接修正这些元数据（metadata fix）。
+
+  capture_images     “页面”。image_name 是身份标识。
+     QC 的内联图片编辑会原地替换图片字节，并重新计算 size/hash/dims，
+     同时更新 image_updated_at。单图是否“需要重拍”从 rework_logs 推导。
+
+  rework_logs        重拍请求日志（唯一需要新增记录的地方）。
+     每个被拒绝图片一条记录（设置 image_id；如果 image_id 为 NULL 则为
+     Folder 范围），rework_status 为 OPEN/CLOSED，rework_comments 为审核员备注，
+     rework_type 用于分类原因。只追加，不修改；按 created_at 最新记录为准。
+     内联修复（crop/deskew/luminance/metadata/separation/delete/replace）
+     不写 rework_logs，它们是已提交编辑，只在本地审计。
+
+审计：
+  复用 LWCAM 现有只追加的 AuditLogService（audit_log_service.dart）记录 QC 动作
+  （open、approve、reject、每个 fix、commit）。不新增云端 audit 表。
+
+并发：
+  QC 可能在多个工位同时连接同一个云数据库。如果两个审核员可能打开同一 Folder，
+  增加轻量 claim 机制（例如 nullable locked_by/locked_at，或合并进任务分配逻辑）。
+  保持最小实现；当前规模不需要完整 lock/heartbeat 子系统。如果新增字段，
+  在 schema PR 中说明选择。
+
+写入路径：
+  QC 写入走 LWCAM 现有 outbox -> PgSyncSink 模式
+  （离线容忍，并与本地镜像保持事务性）。新增 outbox 实体：
+    qc_verdict   设置 qc_status；reject 时重置三个处理标记
+    rework_log   插入 rework_logs 记录；reject 时 OPEN，重拍完成时 CLOSED（第 6 节）
+    capture_folder_processing 已存在，会在 Folder 重新处理后设置
+    qc_status='PENDING' 并恢复处理标记。
+  自然键解析与现有 capture_folder_processing 实体一致
+  （project_key -> box -> folder_seq -> image_name）。复制该 sink 分支即可。
+
+读取路径（拉取）：
+  扩展同步拉取逻辑（类似当前 users/projects 拉取），使 qcEnabled 工位拉取自身范围内
+  qc_status='PENDING' 的 capture_folders，包括首次审核的 Folder（group_id NULL）
+  和从重拍返回的 Folder。
+
+--------------------------------------------------------------------------------
+ 3. 元数据（验证 + 内联修正）
+--------------------------------------------------------------------------------
+
+字段、下拉值、固定字段，以及 Title -> Record Type 映射位于
+METADATA_AND_EXPORT_CONTRACT.txt 第 1 节。
+
+这些值在 CAPTURE 阶段写入 capture_folders；QC 负责验证，并在错误时直接内联修正
+（不打电话、不写 rework_logs，这是一次已提交编辑）。
+
+如果必填字段缺失或无效，不允许 PASS。
+下拉列表/固定值保存在项目模板中（projects.template JSONB），由 LWCam Admin 维护。
+
+--------------------------------------------------------------------------------
+ 4. QC 审核 UI（以提供的两张参考截图为模型）
+--------------------------------------------------------------------------------
+
+任务队列界面（参考截图 1）：
+  - 列：No.、Task/SysTitle、Status、Created、Modified、Total Pages、
+    Export Flag、Exported Time、Cover Tag、Image Tags（以及 group_id）。
+  - 过滤/搜索：task id、status、created/modified 时间范围、group_id。
+  - 分页、排序、基于角色的可见性。双击打开。
+  - 可导出当前显示列/行的 CSV。
+
+QC 界面（参考截图 2：胶片缩略图 + 查看器 + 元数据）：
+  - 布局：
+      左侧缩略图胶片条（pages）
+      中间图片查看器，支持 zoom/pan
+      右侧元数据 + 备注面板
+      顶部操作工具栏
+    普通查看必须使用优化后的 preview，不要直接传输 20 MB 原图。
+
+  - 工具栏动作：
+      Approve
+        -> qc_status='PASS'
+        -> 必填元数据缺失时阻止
+        -> Folder 成为 Export 候选。
+      Reject / Recapture
+        -> 将选中页面标记为需要重拍
+        -> 必须填写备注
+        -> 进入第 6 节。
+      Save
+        -> 提交内联编辑（见第 5 节）。
+      Close
+        -> 释放 Folder。
+
+  - 内联修复工具（编辑能力）：
+      替换选中图片（提供修正后的 .tif）
+      在当前图片前插入图片
+      删除选中图片（不能删到少于 1 张）
+      裁剪
+      纠偏（1 度步进）
+      旋转（90 度步进）+ 批量旋转选中图片
+      调整图片顺序
+      亮度/对比度/Luminance 修复（单张 + 批量）
+        集成 Luminance Correction/ 工具（第 7 节），不要重写算法
+      标记第一页用于拆分（第 8 节）
+      编辑元数据字段（第 3 节）
+      Undo/Redo（仅当前会话）
+      Restore original（按单页恢复原图）
+
+  - 打开 Folder 时，优先加载第一页和可见缩略图，其余内容懒加载，保证查看器响应速度。
+
+UI 资产：
+  Color_Pallete.png / Color_Example.png（本目录）。
+  风格要求：密集、业务操作型、最少点击。复用 LWCAM 现有主题和组件。
+
+--------------------------------------------------------------------------------
+ 5. 内联修复 - Draft / Commit
+--------------------------------------------------------------------------------
+
+内联编辑（crop/deskew/rotate/luminance/replace/insert/delete/sequence/metadata）
+必须先进入草稿状态，直到审核员提交（Save / Approve）：
+  - 在本地工作副本上操作（如配置了本地 NVMe 则使用本地 NVMe），不要直接操作 NAS 文件，
+    以保证交互速度。
+  - 查看器展示草稿结果；只有提交时才替换官方 capture_images 字节。
+  - 提交时：替换官方图片，重新计算 file size / width / height / MD5 / sequence，
+    写入审计记录。
+  - Cancel/Exit 不提交。Undo/redo 只在当前会话有效。
+
+崩溃安全：
+  先写临时文件，再原子替换；编辑中崩溃最多留下临时文件，不会留下半写入的官方图片。
+
+删除限制：
+  Delete 不能让一个 Folder 少于 1 张图片。
+  替换/插入文件必须是可读取的 .tif。
+
+--------------------------------------------------------------------------------
+ 6. 重拍闭环（唯一的 reject 路径）
+--------------------------------------------------------------------------------
+
+当页面确实需要重新拍摄（破损、缺失、不可读）时，审核员 reject：
+
+  1. 对每张被拒绝图片写一条 rework_logs OPEN 记录
+     （image_id、必填备注、rework_type）
+     -> capture_folders.qc_status='REWORK'
+     -> 重置 is_deskewed/is_cropped/is_created_thumbnail = FALSE。
+     这是 QC 唯一写入图片处理归属标记的地方，是文档化例外。
+     所有写入通过 qc_verdict + rework_log outbox 实体完成。
+
+  2. 在 CAPTURE 工位，box 显示 REWORK。
+     该状态由本地从 Folder 的 qc_status 推导而来
+     （云端 capture_boxes.status 仍保持 TRANSFERRED）。
+     Box 重新打开后只显示需要重拍的 Folder，随后只显示需要重拍的图片，
+     避免混乱和误操作。
+
+  3. 操作员重拍被标记图片，保持相同 image_name，并原地替换图片字节
+     （更新 image_updated_at）。Folder 指纹随之变化。
+
+  4. 重新传输 -> Folder 的 processing marker 被重写 -> LWIP 自动检测指纹变化
+     -> 重新处理 -> 现有 capture_folder_processing 路径将处理标记恢复 TRUE，
+     并把 qc_status 改回 'PENDING'。
+
+  5. LWCAM 在重传 + 重新处理成功后，为被重拍图片写一条 CLOSED rework_logs 记录
+     （只追加）。如果重新审核时重拍仍不合格，QC 再新开一条 OPEN 记录。
+
+  6. Folder 重新进入 QC PENDING 队列，等待再次审核。
+
+--------------------------------------------------------------------------------
+ 7. Luminance Correction（集成提取工具，不要重写）
+--------------------------------------------------------------------------------
+
+交付包中的 Luminance Correction/ 文件夹是已提取的独立亮度/对比度/明度修复工具
+（Python，numpy + Pillow），包含生产调优设置
+（参考 profile、preset、均匀曝光、中心阴影修复、黑底保护、TIFF 压缩保留）。
+程序化使用方式见其 README：
+
+    from luminance_process import process_image, read_config
+    cfg = read_config(Path("config.txt"))
+    process_image(Path(page_tif), cfg)   # 原地修正一张图片
+
+将它接入 QC 的 “Luminance” 动作：
+  - 单张选中图片 = 调用一次
+  - 批量选中图片 = 对每页各调用一次
+  - 按第 5 节 draft/commit 规则作用在本地工作副本上
+
+原 “Auto Fix” 一键流水线故意不属于本模块。
+本模块只集成 luminance 作为 QC 的图片修复步骤；crop/deskew/rotate 由 QC 编辑器工具直接完成。
+
+--------------------------------------------------------------------------------
+ 8. 拆分（将一个 Folder 拆成多个子 Folder）
+--------------------------------------------------------------------------------
+
+这是 QC 的内联操作，不是 reject：通过标记“第一页”把一个 Folder 拆成多个子 Folder。
+
+  - 可标记/取消标记第 1..n 页作为子 Folder 边界。
+    允许单页组；已拆分过的 Folder 也可以再次拆分
+    （子 Folder 命名为 _001、_001_001 等）。
+
+  - 子 ID = <parentFolderName>_NNN。
+    在 schema 中，这意味着新增 capture_folders 记录
+    （在 box 内生成新的 folder_seq，或采用你定义的命名约定），并把 capture_images
+    重新分配到子 Folder（folder_id），每个子 Folder 拥有自己的图片顺序。
+
+  - 子 Folder 继承（复制）父 Folder 的元数据；审核员按需修改复制来的元数据；
+    每个子 Folder 独立 QC / Export。
+
+  - COMMIT 必须防止数据丢失：
+    先创建子 Folder 并验证其图片记录，再将父 Folder 从活跃队列移除
+    （一个事务内完成）。
+
+开放设计点：
+  子 Folder 在 box/folder schema 中的准确表示方式尚未确定
+  （复用 capture_folders 并增加 parent-ref 字段，或使用命名约定）。
+  需要决定并在 schema PR 中记录。
+  开发团队可在核心 QC / 重拍闭环完成后再分阶段实现此功能。
+
+--------------------------------------------------------------------------------
+ 9. 验收标准（v1）
+--------------------------------------------------------------------------------
+admin / Admin@123456
+qc_test / Test@123456
+
+- 已处理 Folder 会以 qc_status='PENDING' 出现在 QC Task Queue。
+- 审核员可以 zoom/pan 优化后的 preview；打开时优先加载第一页和可见缩略图；
+  普通查看不传输 20 MB 原图。
+- 内联修复
+  （crop/deskew/rotate/batch-rotate/luminance single+batch/replace/insert/
+   delete/sequence/metadata）
+  先显示为草稿；官方图片只在 commit 后变化，并重新计算 size/MD5/dims/sequence，
+  同时写入审计。
+- Delete 不能让一个 Folder 少于 1 张图片。
+- PASS 前强制校验必填元数据；PASS -> qc_status='PASS'，Folder 可进入 Export。
+- Reject -> rework_logs OPEN + qc_status='REWORK' + 三个处理标记重置；
+  采集工位将 box 显示为 REWORK，并只暴露需要重新拍摄的页面；
+  重拍（相同 image_name，原地替换）-> 重新处理 -> qc_status 回到 PENDING
+  -> rework_logs CLOSED -> 重新 QC。
+- Separation：父 Folder 离开队列前，必须已创建并验证子 Folder；不丢图片；
+  子 Folder 携带复制的元数据。
+- 每个动作都有审计（本地 audit log），每次数据库写入都通过 outbox；
+  不允许直接第二写入路径；编辑中崩溃最多留下临时文件。
+
+--------------------------------------------------------------------------------
+ 10. 待确认的实现检查项
+--------------------------------------------------------------------------------
+
+- 如果 QC 在多个工位运行，需要并发 claim 机制（第 2 节），保持最小实现。
+- 子 Folder 在 folder schema 中的表示方式（第 8 节）。
+- 内联图片编辑是否需要重新触发 LWIP 复核，还是信任提交后的 .tif 为最终结果。
+  默认：信任 commit；只有重拍才重新触发处理。
+- 内联修复生成的 .tif 使用 adobe_deflate（与 Export，模块 2 一致），并尽量保留
+  色深/ICC。
+- QC 预览所使用的磁盘格式（jpg 优化 preview 还是完整 .tif）需要在实现时确认。

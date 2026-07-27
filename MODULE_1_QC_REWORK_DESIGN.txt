@@ -1,0 +1,263 @@
+================================================================================
+ MODULE 1 — QC + IMAGE FIX + REWORK
+ Design guide & requirements for the incoming dev team
+================================================================================
+
+Status:   To be built from scratch (needs a QC review UI).
+Runs in:  LWCAM (Flutter Windows desktop), as a per-station phase toggled by
+          NodeConfig.qcEnabled (the toggle already exists in Station Setup).
+
+Core principle (keep the logic simple):
+    REJECT  = the page must be physically re-captured.
+    Everything else is FIXED inside QC and the folder is PASSED.
+There is no elaborate multi-state rework pipeline. A reviewer fixes what is
+fixable in the QC screen (crop, deskew, rotate, luminance, metadata,
+separation, delete, replace, re-order) and approves; the ONLY reason to send a
+folder back is that one or more images need a new photo.
+
+Read first: ../ARCHITECTURE.md (pipeline + column ownership),
+            METADATA_AND_EXPORT_CONTRACT.txt (the metadata fields QC verifies),
+            LWCAM/TECHNICAL_DOCUMENTATION.md (sync outbox, capture integrity),
+            Luminance Correction/ (the image-correction tool QC integrates).
+
+--------------------------------------------------------------------------------
+ 1. POSITION IN THE PIPELINE
+--------------------------------------------------------------------------------
+
+After capture -> transfer -> image processing (LWIP), a folder lands with:
+  qc_status='PENDING', is_deskewed/is_cropped/is_created_thumbnail=TRUE,
+  folder_path + thumbnail_path set, group_id=NULL.
+
+QC is the next phase. A reviewer (on a qcEnabled station) opens a PENDING
+folder, reviews the pages, and either:
+  - APPROVES (after any inline fixes)  -> qc_status='PASS' -> eligible for
+    Export (Module 2).
+  - REJECTS (a page needs re-capture)  -> qc_status='REWORK' -> recapture loop
+    (§6) -> back to PENDING -> re-reviewed.
+
+A "task" == one capture_folder. A "page" == one capture_images row. Work is
+discovered from the DB (no NAS re-import): QC reads capture_folders where
+qc_status='PENDING'. Previews are served from folder_path/thumbnail_path.
+
+--------------------------------------------------------------------------------
+ 2. DATA MODEL — USE THE EXISTING SCHEMA, NO NEW TABLES
+--------------------------------------------------------------------------------
+
+The shared schema already has everything QC needs (see LWCam_database SQL and
+ARCHITECTURE.md §4). Do NOT add QC-specific tables.
+
+  capture_folders    the "task".
+     qc_status        PENDING | PASS | REWORK  (the QC verdict / state)
+     group_id         the export identity; NULL until export mints it (Module 2)
+     is_deskewed / is_cropped / is_created_thumbnail / folder_path /
+       thumbnail_path   processing result; QC RESETS the three flags to FALSE
+       when it rejects for recapture (§6) so the folder is re-processed on return
+     metadata columns (cover_tag, title, volume, dates, archival_ref_no, ...)
+       QC may correct these inline (metadata fix)
+  capture_images     the "pages". image_name = identity. QC's inline image edits
+     replace the bytes in place and recompute size/hash/dims (image_updated_at
+     bumped). Per-image "needs recapture" state is DERIVED from rework_logs.
+  rework_logs        the RECAPTURE REQUEST log (the only thing that needs a row).
+     One row per rejected image (image_id set; folder-scoped if image_id NULL),
+     rework_status OPEN/CLOSED, rework_comments = reviewer remarks,
+     rework_type classifies the reason. Append-only; latest-by-created_at wins.
+     Inline fixes (crop/deskew/luminance/metadata/separation/delete/replace) do
+     NOT create rework_logs rows — they are committed edits, audited locally.
+
+Audit: reuse LWCAM's existing append-only AuditLogService (audit_log_service.
+dart) for QC actions (open, approve, reject, each fix, commit). No cloud audit
+table.
+
+Concurrency: QC may run on more than one station against the same cloud DB. If
+two reviewers could open the same folder, add a LIGHTWEIGHT claim (e.g. a
+nullable locked_by/locked_at, or fold it into how folders are assigned) — keep
+it minimal; a full lock/heartbeat subsystem is not required at this scale. Flag
+your choice in the schema PR if you add a column.
+
+Write path: QC writes go through LWCAM's existing outbox -> PgSyncSink pattern
+(offline-tolerant, transactional with the local mirror). Add outbox entities:
+  qc_verdict   sets qc_status (and, on reject, resets the three processing flags)
+  rework_log   inserts a rework_logs row (OPEN on reject; CLOSED on recapture
+               completion, §6)
+  (capture_folder_processing already exists and resets qc_status='PENDING' +
+   the processing flags when a folder is reprocessed.)
+Natural-key resolution is identical to the existing capture_folder_processing
+entity (project_key -> box -> folder_seq -> image_name). Copy that sink case.
+
+Read path (intake): extend the sync pull (the way users/projects are pulled
+today) so a qcEnabled station pulls capture_folders in scope where
+qc_status='PENDING' (both first-pass, group_id NULL, and returned-from-recapture).
+
+--------------------------------------------------------------------------------
+ 3. METADATA (verify + inline correct)
+--------------------------------------------------------------------------------
+
+Fields, dropdown values, fixed fields, and the Title->Record Type mapping are in
+METADATA_AND_EXPORT_CONTRACT.txt §1. They are keyed at CAPTURE time into
+capture_folders; QC verifies them and corrects them INLINE when wrong (no phone,
+no rework_logs row — it's a committed edit). Approval to PASS is BLOCKED until
+all mandatory fields are present and valid. Dropdown lists / fixed values live
+in the project template (projects.template JSONB, owned by LWCam Admin).
+
+--------------------------------------------------------------------------------
+ 4. QC REVIEW UI  (model on the two reference screenshots supplied)
+----------------------------------------------
+---------------------------------
+
+TASK QUEUE screen (reference screenshot 1):
+  - Columns: No., Task/SysTitle, Status, Created, Modified, Total Pages,
+    Export Flag, Exported Time, Cover Tag, Image Tags (+ group_id).
+  - Filter/search: task id, status, created/modified range, group_id.
+  - Pagination, sorting, role-based visibility. Open on double-click.
+  - CSV export of the currently-shown columns/rows.
+
+QC screen (reference screenshot 2 — filmstrip + viewer + metadata):
+  - Layout: LEFT thumbnail filmstrip (pages) | CENTER image viewer with
+    zoom/pan (serve the OPTIMIZED preview, never the full 20 MB original for
+    ordinary viewing) | RIGHT metadata + comment panel | TOP action toolbar.
+  - Toolbar actions:
+      Approve            -> qc_status='PASS' (blocks if mandatory metadata
+                            missing); folder becomes Export-eligible.
+      Reject / Recapture -> mark selected page(s) for recapture (mandatory
+                            remark) -> §6.
+      Save               -> commit inline edits (see §5).
+      Close              -> release the folder.
+  - Inline fix tools (the editing surface):
+      Replace selected image (supply a corrected .tif)
+      Insert image before current
+      Delete selected image (never below 1 image)
+      Crop
+      Deskew (1-degree steps)
+      Rotate (90-degree steps) + Batch rotate selected images
+      Adjust image sequence
+      Brightness/contrast/Luminance correction (single + batch) -- integrate the
+        Luminance Correction/ tool (§7), do NOT rebuild the algorithm
+      Mark first pages for separation (§8)
+      Edit metadata fields (§3)
+      Undo/Redo (session-only), Restore original (per page)
+  - Opening a folder prioritizes the first page + visible thumbnails, then lazy-
+    loads the rest, so the viewer stays responsive.
+
+UI assets: Color_Pallete.png / Color_Example.png (this folder). Dense,
+operational, minimal-clicks. Reuse LWCAM's existing theme/components.
+
+--------------------------------------------------------------------------------
+ 5. INLINE FIX — DRAFT / COMMIT
+--------------------------------------------------------------------------------
+
+Inline edits (crop/deskew/rotate/luminance/replace/insert/delete/sequence/
+metadata) should be DRAFT until the reviewer commits (Save / Approve):
+  - Work on a LOCAL working copy (local NVMe if configured), not the NAS file,
+    for interactive speed.
+  - The viewer shows the draft result; the official capture_images bytes are
+    replaced only on commit.
+  - On commit: replace the official image(s), recompute file size / width /
+    height / MD5 / sequence, write the audit entry.
+  - Cancel/Exit does not commit. Undo/redo is session-only.
+Crash-safety: write to a temp file and atomically replace; a crash mid-edit
+leaves only a temp file, never a half-written official image.
+Delete must never reduce a folder below 1 image; replacement/inserted files must
+be readable .tif.
+
+--------------------------------------------------------------------------------
+ 6. THE RECAPTURE LOOP  (the only "reject" path)
+--------------------------------------------------------------------------------
+
+When a page genuinely needs a new photo (torn/missing/unreadable), the reviewer
+rejects it:
+  1. rework_logs OPEN row per rejected image (image_id, mandatory remark,
+     rework_type) -> capture_folders.qc_status='REWORK' -> RESET
+     is_deskewed/is_cropped/is_created_thumbnail = FALSE (the one place QC writes
+     the processing-owned flags; documented exception). All via the qc_verdict +
+     rework_log outbox entities.
+  2. On the CAPTURE station, the box shows REWORK, DERIVED LOCALLY from its
+     folders' qc_status on pull (capture_boxes.status stays TRANSFERRED in
+     cloud). The box reopens showing ONLY the folders, then only the images,
+     that need recapture (prevents clutter/mistakes).
+  3. The operator re-captures the flagged image, keeping the SAME image_name and
+     replacing the bytes IN PLACE (image_updated_at bumped). The folder's
+     fingerprint changes.
+  4. Re-transfer -> the folder's processing marker is rewritten -> LWIP
+     auto-detects the changed fingerprint -> reprocesses -> the existing
+     capture_folder_processing path sets the processing flags back TRUE and
+     qc_status back to 'PENDING'.
+  5. LWCAM writes a CLOSED rework_logs row for the recaptured image on
+     successful re-transfer+reprocess (append-only; QC opens a NEW row if the
+     recapture is still bad on re-review).
+  6. Folder re-enters the QC PENDING queue -> re-reviewed.
+
+--------------------------------------------------------------------------------
+ 7. LUMINANCE CORRECTION (integrate the extracted tool — do NOT rebuild it)
+--------------------------------------------------------------------------------
+
+The Luminance Correction/ folder in this handover is the extracted, standalone
+brightness/contrast/luminance tool (Python, numpy + Pillow) with production-
+tuned settings (reference profiles, presets, even-exposure, center-shadow fix,
+black-background protection, TIFF-compression preservation). See its README for
+programmatic use:
+
+    from luminance_process import process_image, read_config
+    cfg = read_config(Path("config.txt"))
+    process_image(Path(page_tif), cfg)   # corrects one image in place
+
+Wire it into the QC "Luminance" action: single selected image = one call; batch
+= one call per selected page. Apply on the LOCAL working copy under the draft/
+commit rule (§5). (The former "Auto Fix" one-click pipeline is intentionally NOT
+part of this module — luminance is the image-correction step QC integrates;
+crop/deskew/rotate are done with the QC editor tools directly.)
+
+--------------------------------------------------------------------------------
+ 8. SEPARATION (split a folder into children)
+--------------------------------------------------------------------------------
+
+An inline QC operation (not a reject): split one folder into multiple child
+folders by marking "first pages".
+  - Mark/unmark page 1..n as a child boundary. One-page groups allowed; a folder
+    can be split again after a prior split (children get _001, _001_001, ...).
+  - Child id = <parentFolderName>_NNN. In the schema this means new
+    capture_folders rows (new folder_seq within the box, or a naming convention
+    you define) with capture_images reassigned (folder_id) to the child, each
+    child getting its own image sequence.
+  - Children INHERIT (copy) the parent's metadata; the reviewer updates copied
+    metadata where needed; each child is QC'd/exported independently.
+  - COMMIT must be data-loss-safe: create children and verify their image records
+    BEFORE removing the parent from the active queue (one transaction).
+OPEN DESIGN POINT: exact representation of children in the box/folder schema
+(reuse capture_folders with a parent-ref column vs a naming convention). Decide
+and note it in the schema PR. The dev team may stage this feature after the
+core QC/recapture loop is working.
+
+--------------------------------------------------------------------------------
+ 9. ACCEPTANCE CRITERIA (v1)
+--------------------------------------------------------------------------------
+
+- A processed folder appears in the QC Task Queue at qc_status='PENDING'.
+- Reviewer can zoom/pan the optimized preview; opening prioritizes the first
+  page + visible thumbnails; the 20 MB original is never sent for ordinary view.
+- Inline fixes (crop/deskew/rotate/batch-rotate/luminance single+batch/replace/
+  insert/delete/sequence/metadata) show as draft; official images change only on
+  commit, which recomputes size/MD5/dims/sequence and audits.
+- Delete never reduces a folder below 1 image.
+- Mandatory metadata enforced before PASS; PASS -> qc_status='PASS', folder
+  Export-eligible.
+- Reject -> rework_logs OPEN + qc_status='REWORK' + the three processing flags
+  reset; the capture station shows the box as REWORK exposing only the pages
+  needing a new photo; recapture (same image_name, in place) -> reprocess ->
+  qc_status back to PENDING -> rework_logs CLOSED -> re-QC.
+- Separation: children created + verified before the parent leaves the queue;
+  no image lost; children carry copied metadata.
+- Every action is audited (local audit log) and every DB write goes through the
+  outbox (no direct second write path); a crash mid-edit leaves only temp files.
+
+--------------------------------------------------------------------------------
+ 10. OPEN IMPLEMENTATION CHECKS
+--------------------------------------------------------------------------------
+
+- Concurrency claim mechanism if QC runs on multiple stations (§2) — keep minimal.
+- Separation representation in the folder schema (§8).
+- Whether inline Image edits should re-trigger LWIP (re-verify) or trust the
+  committed .tif as final. Default: trust the commit; re-trigger only recapture.
+- .tif produced by inline fixes uses adobe_deflate (matches Export, Module 2) and
+  preserves color depth/ICC where possible.
+- The processed on-disk format QC previews from (jpg optimized preview vs full
+  .tif) — confirm during implementation.

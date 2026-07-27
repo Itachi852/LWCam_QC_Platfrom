@@ -1,0 +1,64 @@
+import { onBeforeUnmount, ref, watch, type Ref } from 'vue'
+import request from '@/api/client'
+import { i18n } from '@/i18n'
+
+interface PreviewImage {
+  previewUrl: string
+}
+
+function toApiPath(url: string) {
+  return url.startsWith('/api/') ? url.slice(4) : url
+}
+
+export function usePreviewImage(image: Ref<PreviewImage | null>) {
+  const previewSrc = ref('')
+  const previewLoading = ref(false)
+  const previewError = ref('')
+  let objectUrl = ''
+  let requestId = 0
+
+  function revokePreview() {
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl)
+      objectUrl = ''
+    }
+    previewSrc.value = ''
+  }
+
+  watch(
+    image,
+    async (nextImage) => {
+      const currentRequest = ++requestId
+      revokePreview()
+      previewError.value = ''
+
+      if (!nextImage?.previewUrl) return
+
+      previewLoading.value = true
+      try {
+        const { data } = await request.get<Blob>(toApiPath(nextImage.previewUrl), { responseType: 'blob' })
+        if (currentRequest !== requestId) return
+
+        objectUrl = URL.createObjectURL(data)
+        previewSrc.value = objectUrl
+      } catch (error) {
+        if (currentRequest === requestId) {
+          previewError.value = (error as Error).message || i18n.global.t('errors.imageLoadFailed')
+        }
+      } finally {
+        if (currentRequest === requestId) {
+          previewLoading.value = false
+        }
+      }
+    },
+    { immediate: true },
+  )
+
+  onBeforeUnmount(revokePreview)
+
+  return {
+    previewSrc,
+    previewLoading,
+    previewError,
+  }
+}
