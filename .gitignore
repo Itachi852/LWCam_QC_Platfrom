@@ -1,23 +1,28 @@
 .env
 .env.local
 *.log
+
 .idea/
 .vscode/
+.claude/settings.local.json
 
-/tecdocs/
-/shared-images/
-/scripts/
-/database/
-/docs/
+tecdocs/
+docs/
+shared-images/
+database/
+
 backend/.venv/
-backend/__pycache__/
+backend/scripts/
+backend/**/__pycache__/
 backend/**/*.py[cod]
 backend/.pytest_cache/
 backend/.ruff_cache/
 backend/.mypy_cache/
 backend/.cache/
-backend/scripts/
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
 
+scripts/serve_frontend.py
+shared-images/test-data/
+/LWCam_database_*.sql
