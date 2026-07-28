@@ -32,9 +32,7 @@ docker-compose.yml
 - PostgreSQL 已允许 Docker 容器所在机器访问，数据库端口已在防火墙中放行。
 - 采集图片目录已准备好，并且 Docker 有权读取和修改该目录。
 
-> 不要对现有共享数据库直接执行历史脚本
-> `database/migrations/001_init_schema.sql`。该脚本与当前后端使用的共享
-> LWCam Schema 不兼容。数据库升级应先备份，再由数据库管理员确认需要执行的迁移。
+
 
 ### 2. 创建环境变量文件
 
