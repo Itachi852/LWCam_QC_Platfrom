@@ -2,10 +2,10 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 
-COPY index.html tsconfig.json vite.config.ts ./
+COPY index.html tsconfig.json tsconfig.node.json vite.config.ts ./
 COPY src ./src
 
 EXPOSE 5174
