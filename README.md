@@ -265,6 +265,20 @@ docker compose ps
 docker compose logs --tail=200 backend
 ```
 
+#### 后端显示 `ModuleNotFoundError`
+
+这表示当前后端镜像不完整，或者仍在使用修改前的旧镜像。先确认报错文件已经存在于
+`backend/app`，然后强制重新构建后端：
+
+```powershell
+docker compose build --no-cache backend
+docker compose up -d --force-recreate backend
+docker compose up -d frontend
+```
+
+如果项目通过 Git、CI 或另一台服务器部署，还必须确认缺失文件已经加入 Git 并同步到
+部署机器。仅存在于开发机工作区中的未跟踪文件不会出现在其他机器的 Docker 构建上下文中。
+
 #### 页面能打开，但图片显示不存在
 
 这通常不是前端问题。检查：

@@ -6,10 +6,10 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 COPY pyproject.toml README.md ./
-RUN pip install --no-cache-dir -e .
-
 COPY app ./app
 COPY alembic.ini ./
+
+RUN pip install --no-cache-dir .
 
 EXPOSE 8080
 
