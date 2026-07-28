@@ -1,59 +1,69 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: lwcam-py-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: ${DB_NAME:-lwcam}
-      POSTGRES_USER: ${DB_USER:-lwcam}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-lwcam}
-    ports:
-      - "${DB_PORT:-5432}:5432"
-    volumes:
-      - lwcam_py_pg_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-lwcam} -d ${DB_NAME:-lwcam}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   backend:
     build:
       context: ./backend
-    container_name: lwcam-py-backend
     restart: unless-stopped
     environment:
       APP_NAME: LWCam Python Backend
       APP_ENV: docker
-      APP_DEBUG: "true"
+      APP_DEBUG: ${APP_DEBUG:-false}
       API_PREFIX: /api
-      DB_HOST: postgres
-      DB_PORT: 5432
+      DB_HOST: ${DB_HOST:-host.docker.internal}
+      DB_PORT: ${DB_PORT:-5432}
       DB_NAME: ${DB_NAME:-lwcam}
       DB_USER: ${DB_USER:-lwcam}
       DB_PASSWORD: ${DB_PASSWORD:-lwcam}
       JWT_SECRET: ${JWT_SECRET:-lwcam-dev-secret-change-in-production-min-32-chars}
-      JWT_EXPIRE_MINUTES: 480
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-480}
+      PREVIEW_CACHE_DIR: /app/.cache/previews
+      QC_WORK_DIR: /app/.cache/qc_work
+      QC_AUDIT_DIR: /app/.cache/qc_audit
     volumes:
       - ${CAPTURE_IMAGE_HOST_PATH:-./shared-images}:${CAPTURE_IMAGE_CONTAINER_PATH:-/data/shared-images}:rw
+      - lwcam_py_backend_cache:/app/.cache
     ports:
       - "${BACKEND_PORT:-8080}:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/docs', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   frontend:
     build:
       context: ./frontend
-    container_name: lwcam-py-frontend
     restart: unless-stopped
     environment:
       VITE_API_TARGET: http://backend:8080
     ports:
       - "${FRONTEND_PORT:-5174}:5174"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://127.0.0.1:5174/",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
 volumes:
-  lwcam_py_pg_data:
+  lwcam_py_backend_cache:
 
