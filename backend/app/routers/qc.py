@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -40,6 +41,7 @@ from app.schemas.qc import (
 from app.services.luminance import apply_luminance
 from app.services.previews import PREVIEW_MIME_TYPE, generate_preview_image, generate_thumbnail_file
 from app.services.qc_audit import write_qc_audit
+from app.services.qc_separation import SeparationFileError, SeparationFileTransaction
 from app.services.qc_drafts import (
     create_inserted_image,
     delete_image as draft_delete_image,
@@ -67,6 +69,7 @@ from app.services.qc_drafts import (
 )
 
 router = APIRouter(prefix="/qc/metadata-tasks", tags=["metadata-qc"])
+logger = logging.getLogger(__name__)
 DB_TO_API_STATUS = {"pending": "pending", "pass": "passed", "rework": "rework"}
 TITLE_RECORD_TYPE_MAP = {
     "WWI South African Mounted Rifles Military Personnel Cards": "Military Service Records",
@@ -628,7 +631,7 @@ def apply_separation_commit(
     marker_ids: list[int],
     ordered_ids: list[int],
     commit_time: datetime,
-) -> None:
+) -> SeparationFileTransaction:
     marker_set = set(marker_ids)
     if len(marker_set) < 2:
         raise ValueError("Separation 至少需要两个起始页")
@@ -650,62 +653,105 @@ def apply_separation_commit(
     max_seq = db.scalar(select(func.max(CaptureFolder.folder_seq)).where(CaptureFolder.box_id == folder.box_id)) or 0
     image_lookup = {
         image.id: image
-        for image in db.scalars(select(CaptureImage).where(CaptureImage.id.in_(ordered_ids))).all()
+        for image in db.scalars(
+            select(CaptureImage).where(
+                CaptureImage.id.in_(ordered_ids),
+                CaptureImage.folder_id == folder.id,
+            )
+        ).all()
     }
-    for index, group in enumerate(groups, start=1):
-        child = CaptureFolder(
-            group_id=folder.group_id,
-            folder_name=f"{folder.folder_name}_{index:03d}",
-            box_id=folder.box_id,
-            device_id=folder.device_id,
-            folder_seq=max_seq + index,
-            cover_tag=folder.cover_tag,
-            image_tags=folder.image_tags,
-            title=folder.title,
-            volume=folder.volume,
-            start_date=folder.start_date,
-            end_date=folder.end_date,
-            archival_ref_no=folder.archival_ref_no,
-            record_type=folder.record_type,
-            place=folder.place,
-            language=folder.language,
-            record_custodian=folder.record_custodian,
-            capture_operator_id=folder.capture_operator_id,
-            capture_operator_name=folder.capture_operator_name,
-            digitizing_entity=folder.digitizing_entity,
-            source_created_at=commit_time,
-            source_updated_at=commit_time,
-            updated_at=commit_time,
-            is_deleted=False,
-            client_qc_status=folder.client_qc_status,
-            client_rework=False,
-            is_deskewed=folder.is_deskewed,
-            is_cropped=folder.is_cropped,
-            is_created_thumbnail=folder.is_created_thumbnail,
-            folder_path=folder.folder_path,
-            thumbnail_path=folder.thumbnail_path,
-            qc_status="PENDING",
-            is_tif_converted=folder.is_tif_converted,
-        )
-        db.add(child)
+    if set(image_lookup) != set(ordered_ids):
+        raise ValueError("Separation包含不属于当前Folder的图片")
+    if not folder.folder_path:
+        raise ValueError("Folder原图目录未配置")
+
+    grouped_names = [
+        [safe_filename(image_lookup[image_id].image_name) for image_id in group]
+        for group in groups
+    ]
+    file_transaction = SeparationFileTransaction(
+        Path(folder.folder_path),
+        Path(folder.thumbnail_path) if folder.thumbnail_path else None,
+        grouped_names,
+    )
+    file_transaction.apply()
+
+    try:
+        for index, group in enumerate(groups, start=1):
+            file_group = file_transaction.groups[index - 1]
+            child = CaptureFolder(
+                group_id=folder.group_id,
+                folder_name=f"{folder.folder_name}_{index:03d}",
+                box_id=folder.box_id,
+                device_id=folder.device_id,
+                folder_seq=max_seq + index,
+                cover_tag=folder.cover_tag,
+                image_tags=folder.image_tags,
+                title=folder.title,
+                volume=folder.volume,
+                start_date=folder.start_date,
+                end_date=folder.end_date,
+                archival_ref_no=folder.archival_ref_no,
+                record_type=folder.record_type,
+                place=folder.place,
+                language=folder.language,
+                record_custodian=folder.record_custodian,
+                capture_operator_id=folder.capture_operator_id,
+                capture_operator_name=folder.capture_operator_name,
+                digitizing_entity=folder.digitizing_entity,
+                source_created_at=commit_time,
+                source_updated_at=commit_time,
+                updated_at=commit_time,
+                is_deleted=False,
+                client_qc_status=folder.client_qc_status,
+                client_rework=False,
+                is_deskewed=folder.is_deskewed,
+                is_cropped=folder.is_cropped,
+                is_created_thumbnail=folder.is_created_thumbnail,
+                folder_path=str(file_group.final_image_dir),
+                thumbnail_path=(
+                    str(file_group.final_thumbnail_dir)
+                    if file_group.final_thumbnail_dir
+                    else None
+                ),
+                qc_status="PENDING",
+                is_tif_converted=folder.is_tif_converted,
+            )
+            db.add(child)
+            db.flush()
+            for image_id in group:
+                image_lookup[image_id].folder_id = child.id
+
+        folder.qc_status = "PASS"
+        folder.qc_locked_by = None
+        folder.qc_locked_at = None
+        folder.is_deleted = True
+        folder.deleted_at = commit_time
+        folder.folder_path = None
+        folder.thumbnail_path = None
         db.flush()
-        for image_id in group:
-            image = image_lookup.get(image_id)
-            if image:
-                image.folder_id = child.id
-    folder.qc_status = "PASS"
-    folder.qc_locked_by = None
-    folder.qc_locked_at = None
+    except Exception:
+        try:
+            file_transaction.rollback()
+        except SeparationFileError as rollback_error:
+            raise SeparationFileError(
+                f"数据库分离失败，且物理文件回滚失败: {rollback_error}"
+            ) from rollback_error
+        raise
+    return file_transaction
 
 
-def commit_current_draft(folder: CaptureFolder, user_id: str) -> list[CaptureImage]:
+def commit_current_draft(
+    folder: CaptureFolder,
+    user_id: str,
+) -> SeparationFileTransaction | None:
     commit_time = now()
     db = object_session(folder)
     if db is None:
         raise ValueError("Folder is not attached to a database session")
     manifest = read_manifest(folder.id, user_id)
     if not manifest:
-        return []
+        return None
     images_by_id = {image.id: image for image in folder.images}
     template = metadata_template(folder)
     has_metadata_changes = metadata_dirty_from_manifest(manifest)
@@ -791,15 +837,23 @@ def commit_current_draft(folder: CaptureFolder, user_id: str) -> list[CaptureIma
             image.image_created_at = commit_time + timedelta(seconds=index)
 
     markers = [id_map.get(int(item), int(item)) for item in manifest.get("separation_markers", [])]
+    separation_transaction = None
     if markers:
-        apply_separation_commit(db, folder, markers, ordered_ids, commit_time)
+        if folder.qc_locked_by != user_id:
+            raise ValueError("任务已不属于当前审核员")
+        separation_transaction = apply_separation_commit(
+            db,
+            folder,
+            markers,
+            ordered_ids,
+            commit_time,
+        )
 
     if committed or has_metadata_changes or manifest.get("order") or markers:
         folder.is_created_thumbnail = True
         folder.source_updated_at = commit_time
         folder.updated_at = commit_time
-    discard_draft(folder.id, user_id)
-    return committed
+    return separation_transaction
 
 
 @router.get("", response_model=ApiResponse[PageResult[MetadataQcTaskVO]])
@@ -992,16 +1046,39 @@ def approve_task(folder_id: int, request: ReviewRequest, current_user: QcUser, d
     for image in folder.images:
         resolve_image_file(folder, image)
 
+    separation_transaction = None
     try:
-        commit_current_draft(folder, current_user.user_id)
+        separation_transaction = commit_current_draft(folder, current_user.user_id)
+        # Update status and release lock
+        folder.qc_status = "PASS"
+        folder.qc_locked_by = None
+        folder.qc_locked_at = None
+        db.commit()
     except Exception as error:
+        db.rollback()
+        if separation_transaction:
+            try:
+                separation_transaction.rollback()
+            except Exception as rollback_error:
+                logger.exception(
+                    "QC separation rollback failed after approve commit error; folder=%s",
+                    folder_id,
+                )
+                raise BusinessError(
+                    ApiCodes.BAD_REQUEST,
+                    f"Draft保存失败，且物理文件回滚失败: {rollback_error}",
+                    400,
+                ) from error
+        if isinstance(error, SeparationFileError):
+            raise BusinessError(ApiCodes.BAD_REQUEST, str(error), 400) from error
         raise BusinessError(ApiCodes.BAD_REQUEST, "Draft保存失败", 400) from error
 
-    # Update status and release lock
-    folder.qc_status = "PASS"
-    folder.qc_locked_by = None
-    folder.qc_locked_at = None
-    db.commit()
+    try:
+        discard_draft(folder.id, current_user.user_id)
+        if separation_transaction:
+            separation_transaction.cleanup_empty_parent_directories()
+    except Exception:
+        logger.exception("QC draft cleanup failed after approve; folder=%s", folder_id)
     write_qc_audit(
         "approve",
         current_user.user_id,
@@ -1514,11 +1591,35 @@ def save_draft(
             db.commit()
         return child
 
+    separation_transaction = None
     try:
-        commit_current_draft(folder, current_user.user_id)
+        separation_transaction = commit_current_draft(folder, current_user.user_id)
+        db.commit()
     except Exception as error:
+        db.rollback()
+        if separation_transaction:
+            try:
+                separation_transaction.rollback()
+            except Exception as rollback_error:
+                logger.exception(
+                    "QC separation rollback failed after save commit error; folder=%s",
+                    folder_id,
+                )
+                raise BusinessError(
+                    ApiCodes.BAD_REQUEST,
+                    f"Draft保存失败，且物理文件回滚失败: {rollback_error}",
+                    400,
+                ) from error
+        if isinstance(error, SeparationFileError):
+            raise BusinessError(ApiCodes.BAD_REQUEST, str(error), 400) from error
         raise BusinessError(ApiCodes.BAD_REQUEST, "Draft保存失败", 400) from error
-    db.commit()
+
+    try:
+        discard_draft(folder.id, current_user.user_id)
+        if separation_transaction:
+            separation_transaction.cleanup_empty_parent_directories()
+    except Exception:
+        logger.exception("QC draft cleanup failed after save; folder=%s", folder_id)
     write_qc_audit(
         "save",
         current_user.user_id,

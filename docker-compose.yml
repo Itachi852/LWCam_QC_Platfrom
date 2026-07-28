@@ -35,7 +35,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:-lwcam-dev-secret-change-in-production-min-32-chars}
       JWT_EXPIRE_MINUTES: 480
     volumes:
-      - ${CAPTURE_IMAGE_HOST_PATH:-./shared-images}:${CAPTURE_IMAGE_CONTAINER_PATH:-/data/shared-images}:ro
+      - ${CAPTURE_IMAGE_HOST_PATH:-./shared-images}:${CAPTURE_IMAGE_CONTAINER_PATH:-/data/shared-images}:rw
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     depends_on:

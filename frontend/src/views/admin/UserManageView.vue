@@ -155,8 +155,8 @@ onMounted(async () => {
           <el-table-column prop="userId" :label="t('admin.users.username')" width="105" show-overflow-tooltip />
           <el-table-column :label="t('admin.users.status')" width="72"><template #default="{ row }">{{ translateValue('userStatus', row.status) }}</template></el-table-column>
           <el-table-column :label="t('admin.users.role')" width="85"><template #default="{ row }">{{ translateValue('roles', row.role) }}</template></el-table-column>
-          <el-table-column :label="t('admin.users.projects')" min-width="150" show-overflow-tooltip><template #default="{ row }">{{ row.projectNames.join(', ') || '—' }}</template></el-table-column>
-          <el-table-column :label="t('common.actions')" width="140">
+          <el-table-column :label="t('admin.users.projects')" min-width="100" show-overflow-tooltip><template #default="{ row }">{{ row.projectNames.join(', ') || '—' }}</template></el-table-column>
+          <el-table-column :label="t('common.actions')" width="190" class-name="user-actions-column">
             <template #default="{ row }">
               <div class="user-row-actions">
                 <el-button link type="primary" :disabled="row.role === 'super_admin'" @click.stop="openEdit(row)">{{ t('common.edit') }}</el-button>
@@ -229,7 +229,8 @@ onMounted(async () => {
   display: flex;
   flex-wrap: nowrap;
   align-items: center;
-  gap: 6px;
+  justify-content: flex-start;
+  gap: 8px;
   white-space: nowrap;
 }
 
