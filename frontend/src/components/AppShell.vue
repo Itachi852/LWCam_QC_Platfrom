@@ -25,6 +25,7 @@ const navItems = computed(() => {
     { to: '/admin/stats', icon: 'DataAnalysis', label: t('nav.stats') },
     { to: '/admin/users', icon: 'User', label: t('nav.users') },
     { to: '/admin/qc-tasks', icon: 'Unlock', label: t('nav.qcTasks') },
+    { to: '/admin/exports', icon: 'UploadFilled', label: t('nav.exports') },
   ]
 })
 

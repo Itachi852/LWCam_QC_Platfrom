@@ -32,6 +32,12 @@ const router = createRouter({
       meta: { requiresAuth: true, roles: ['admin', 'super_admin'] },
     },
     {
+      path: '/admin/exports',
+      name: 'admin-exports',
+      component: () => import('@/views/admin/ExportManageView.vue'),
+      meta: { requiresAuth: true, roles: ['admin', 'super_admin'] },
+    },
+    {
       path: '/qc/tasks',
       name: 'qc-tasks',
       component: () => import('@/views/qc/QcIndexView.vue'),

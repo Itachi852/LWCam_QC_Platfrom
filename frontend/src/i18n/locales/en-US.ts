@@ -41,6 +41,7 @@ export default {
     stats: 'Statistics',
     users: 'Users',
     qcTasks: 'QC tasks',
+    exports: 'Exports',
   },
 
   auth: {
@@ -179,6 +180,26 @@ export default {
   },
 
   admin: {
+    exports: {
+      title: 'Batch export',
+      subtitle: 'Package QC-approved, unexported folders into contract ZIP files',
+      notReady: 'Export preflight failed',
+      eligible: 'Eligible folders',
+      status: 'Run status',
+      succeeded: 'Succeeded',
+      failed: 'Failed',
+      batch: 'Export batch',
+      run: 'Export all',
+      retry: 'Retry failed',
+      runConfirm: 'Export the current {count} eligible folders?',
+      started: 'Export run started',
+      currentItems: 'Current run items',
+      history: 'Run history',
+      error: 'Error',
+      createdBy: 'Administrator',
+      createdAt: 'Created at',
+      total: 'Total',
+    },
     qcTasks: {
       title: 'QC tasks',
       subtitle: 'Monitor active folders and release abandoned tasks',

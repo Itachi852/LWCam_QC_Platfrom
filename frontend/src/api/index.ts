@@ -4,6 +4,8 @@ import type {
   ApiResponse,
   AuthResponse,
   EditableFolderMetadata,
+  ExportPreflight,
+  ExportRun,
   CropRect,
   MetadataQcTask,
   PageResult,
@@ -36,6 +38,16 @@ export const adminApi = {
     request.get<ApiResponse<PageResult<AdminQcTask>>>('/admin/qc-tasks', { params }),
   releaseQcTask: (folderId: number) =>
     request.post<ApiResponse<void>>(`/admin/qc-tasks/${folderId}/release`),
+  exportPreflight: () =>
+    request.get<ApiResponse<ExportPreflight>>('/admin/exports/preflight'),
+  runExport: () =>
+    request.post<ApiResponse<ExportRun>>('/admin/exports/run'),
+  currentExport: () =>
+    request.get<ApiResponse<ExportRun | null>>('/admin/exports/current'),
+  exportRuns: () =>
+    request.get<ApiResponse<ExportRun[]>>('/admin/exports/runs'),
+  retryExport: () =>
+    request.post<ApiResponse<ExportRun>>('/admin/exports/retry'),
 }
 
 export const qcApi = {

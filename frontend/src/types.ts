@@ -43,6 +43,44 @@ export interface ProjectOption {
   projectName: string
 }
 
+export interface ExportConfig {
+  tempDir: string
+  outputDir: string
+  csvEncoding: string
+  csvLineEnding: string
+}
+
+export interface ExportRunItem {
+  folderId: number
+  status: string
+  groupId?: string
+  zipPath?: string
+  error?: string
+}
+
+export interface ExportRun {
+  runId: string
+  status: string
+  createdBy: string
+  createdAt: string
+  startedAt?: string
+  completedAt?: string
+  total: number
+  succeeded: number
+  failed: number
+  currentFolderId?: number
+  items: ExportRunItem[]
+}
+
+export interface ExportPreflight {
+  ready: boolean
+  errors: string[]
+  eligibleCount: number
+  invalidProjects: Array<{ id: number; projectId: string; projectName: string }>
+  config?: ExportConfig
+  activeRun?: ExportRun
+}
+
 export interface AdminQcTask {
   folderId: number
   folderName: string

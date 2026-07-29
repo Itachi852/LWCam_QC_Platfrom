@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     preview_cache_dir: str = ".cache/previews"
     qc_work_dir: str = ".cache/qc_work"
     qc_audit_dir: str = ".cache/qc_audit"
+    export_temp_dir: str = ""
+    export_output_dir: str = ""
+    export_csv_encoding: str = ""
+    export_csv_line_ending: str = ""
+    export_temp_retention_hours: int = Field(default=24, ge=1)
 
     @cached_property
     def database_url(self) -> str:
