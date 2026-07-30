@@ -49,7 +49,8 @@ if ($exists -ne "1") {
 }
 
 $migrationFiles = @(
-    "002_users_id_sequence.sql"
+    "001_qc_platform_deltas.sql",
+    "002_role_case_normalization.sql"
 )
 
 foreach ($file in $migrationFiles) {

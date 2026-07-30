@@ -30,6 +30,12 @@ class Settings(BaseSettings):
     export_csv_line_ending: str = ""
     export_temp_retention_hours: int = Field(default=24, ge=1)
 
+    # Bind-mount prefixes used to translate the Windows paths LWCAM stores in
+    # capture_folders into container paths. Leave both empty when running
+    # natively on Windows.
+    capture_image_host_path: str = ""
+    capture_image_container_path: str = ""
+
     @cached_property
     def database_url(self) -> str:
         return (

@@ -38,7 +38,10 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 
 def require_roles(*roles: str):
     def dependency(current_user: CurrentUser) -> User:
-        if current_user.role not in roles:
+        # Against role_set, not role: an account may hold several roles, and
+        # `role` reports only the highest-precedence one. Checking that would
+        # deny a 'qc,admin' user every QC endpoint, because admin outranks qc.
+        if current_user.role_set.isdisjoint(roles):
             raise BusinessError(ApiCodes.FORBIDDEN, "无权限访问", 403)
         return current_user
 

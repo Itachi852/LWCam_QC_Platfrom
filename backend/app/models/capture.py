@@ -30,7 +30,14 @@ class CaptureBox(Base):
 
 class CaptureFolder(Base):
     __tablename__ = "capture_folders"
-    __table_args__ = (UniqueConstraint("box_id", "folder_seq", name="uq_capture_folders_box_sequence"),)
+    __table_args__ = (
+        UniqueConstraint("box_id", "folder_seq", name="uq_capture_folders_box_sequence"),
+        # The live schema constrains group_id to be unique (multiple NULLs are
+        # still fine). Declared here because it is not obvious from the column
+        # definition, and Separation has to suffix each child's value to respect
+        # it — see qc.child_group_id.
+        UniqueConstraint("group_id", name="capture_folders_group_id_key"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     group_id: Mapped[str | None] = mapped_column(String(255))

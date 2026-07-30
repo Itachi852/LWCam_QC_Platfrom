@@ -6,9 +6,14 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 
 
+# Written verbatim into the shared `users.roles` column. Lowercase to match the
+# Dart UserRole enum names LWCAM/LWCamAdmin parse — their `fromJson` is an exact
+# lowercase match, so 'Admin' would silently revoke that account's admin role in
+# the capture apps. Reads stay case-insensitive (see `normalize_role`), so rows
+# written by earlier builds keep working.
 ROLE_SUPER_ADMIN = "SuperAdmin"
-ROLE_ADMIN = "Admin"
-ROLE_QC = "QC"
+ROLE_ADMIN = "admin"
+ROLE_QC = "qc"
 
 
 def normalize_role(value: str) -> str:
@@ -50,19 +55,34 @@ class User(Base):
     )
 
     @property
-    def role(self) -> str:
+    def role_set(self) -> set[str]:
+        """Every role this account holds, normalized.
+
+        `users.roles` is a comma-joined list shared with LWCAM/LWCamAdmin, where
+        holding several ('admin,capture', 'qc,admin') is normal. Authorization
+        must use this, never [role] — that one collapses the list to a single
+        value and would deny a role the account genuinely has.
+        """
         raw_roles = self.roles or ""
         for marker in ("{", "}", "[", "]", '"', "'"):
             raw_roles = raw_roles.replace(marker, "")
-        normalized = [
+        return {
             normalize_role(role)
             for role in raw_roles.replace(";", ",").replace("|", ",").split(",")
             if role.strip()
-        ]
+        }
+
+    @property
+    def role(self) -> str:
+        """The single highest-precedence role, for DISPLAY and default landing page.
+
+        Not an authorization answer — see [role_set].
+        """
+        normalized = self.role_set
         for candidate in ("super_admin", "admin", "qc"):
             if candidate in normalized:
                 return candidate
-        return normalized[0] if normalized else ""
+        return next(iter(sorted(normalized)), "")
 
     @property
     def status(self) -> str:

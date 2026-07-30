@@ -20,6 +20,9 @@ class UserVO(BaseModel):
     id: int
     userId: str
     role: str
+    # Every role held. `role` is the display/landing one; route guards must use
+    # this, or a 'qc,admin' account loses access to the QC views.
+    roles: list[str] = []
     status: str
     homePath: str
     mustChangePassword: bool

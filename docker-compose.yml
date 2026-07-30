@@ -18,9 +18,31 @@ services:
       PREVIEW_CACHE_DIR: /app/.cache/previews
       QC_WORK_DIR: /app/.cache/qc_work
       QC_AUDIT_DIR: /app/.cache/qc_audit
+      # Must match the volume pair below so paths stored by LWCAM resolve in
+      # the backend container.
+      CAPTURE_IMAGE_HOST_PATH: ${CAPTURE_IMAGE_HOST_PATH:-./shared-images}
+      CAPTURE_IMAGE_CONTAINER_PATH: ${CAPTURE_IMAGE_CONTAINER_PATH:-/data/shared-images}
+      # Export writes only container paths. The Windows host directories are
+      # supplied through the bind mounts below.
+      EXPORT_TEMP_DIR: /data/export-temp
+      EXPORT_OUTPUT_DIR: /data/export
+      EXPORT_CSV_ENCODING: ${EXPORT_CSV_ENCODING:-utf-8}
+      EXPORT_CSV_LINE_ENDING: ${EXPORT_CSV_LINE_ENDING:-CRLF}
+      EXPORT_TEMP_RETENTION_HOURS: ${EXPORT_TEMP_RETENTION_HOURS:-24}
     volumes:
-      - ${CAPTURE_IMAGE_HOST_PATH:-./shared-images}:${CAPTURE_IMAGE_CONTAINER_PATH:-/data/shared-images}:rw
-      - lwcam_py_backend_cache:/app/.cache
+      # Keep this host prefix identical to the prefix stored in folder_path.
+      - type: bind
+        source: ${CAPTURE_IMAGE_HOST_PATH:-./shared-images}
+        target: ${CAPTURE_IMAGE_CONTAINER_PATH:-/data/shared-images}
+      - type: bind
+        source: ${EXPORT_TEMP_HOST_PATH:-E:\\LifeWodd\\ExportTemp}
+        target: /data/export-temp
+      - type: bind
+        source: ${EXPORT_OUTPUT_HOST_PATH:-E:\\LifeWodd\\Export}
+        target: /data/export
+      - type: volume
+        source: lwcam_py_backend_cache
+        target: /app/.cache
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     extra_hosts:

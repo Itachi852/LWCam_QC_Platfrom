@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import object_session
 
 from app.core.errors import ApiCodes, BusinessError
+from app.core.paths import to_db, to_local
 from app.core.responses import ApiResponse, PageResult, ok
 from app.dependencies import DbSession, QcUser
 from app.models.capture import CaptureBox, CaptureFolder, CaptureImage
@@ -71,6 +72,12 @@ from app.services.qc_drafts import (
 router = APIRouter(prefix="/qc/metadata-tasks", tags=["metadata-qc"])
 logger = logging.getLogger(__name__)
 DB_TO_API_STATUS = {"pending": "pending", "pass": "passed", "rework": "rework"}
+
+# Accepted for Replace / Insert-before. Capture output is .jpg today and only
+# becomes .tif at export (capture_folders.is_tif_converted), so restricting
+# these actions to .tif made them unusable on pre-export folders. Matches the
+# set the bundled Luminance Correction tool already accepts.
+UPLOAD_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 TITLE_RECORD_TYPE_MAP = {
     "WWI South African Mounted Rifles Military Personnel Cards": "Military Service Records",
     "WWI South African Mounted Rifles Military Indexes": "Military Service Record Indexes",
@@ -188,9 +195,17 @@ def project_ids_for_user(db, user_id: int) -> list[int]:
 
 
 def visible_folder_conditions(project_ids: list[int]):
-    """构造 QC 可见任务的通用过滤条件。"""
+    """构造 QC 可见任务的通用过滤条件。
+
+    folder_path is written by LWCAM only after LWIP finishes deskew/crop/thumbnail
+    processing, while qc_status defaults to 'PENDING' the moment the row syncs.
+    Without the NULL check a folder becomes claimable before its images exist on
+    disk, and every image request then 404s — so treat "has an image directory"
+    as part of being a QC task at all.
+    """
     return (
         CaptureFolder.is_deleted.is_not(True),
+        CaptureFolder.folder_path.is_not(None),
         CaptureFolder.box.has(CaptureBox.is_deleted.is_not(True)),
         CaptureFolder.box.has(CaptureBox.project_id.in_(project_ids)),
         CaptureFolder.box.has(CaptureBox.project.has(Project.is_deleted.is_not(True))),
@@ -213,7 +228,7 @@ def safe_backup_part(value: str) -> str:
 def thumbnail_target_path(folder: CaptureFolder, image: CaptureImage) -> Path | None:
     if not folder.thumbnail_path:
         return None
-    directory = Path(folder.thumbnail_path).expanduser().resolve()
+    directory = to_local(folder.thumbnail_path).resolve()
     filename = safe_filename(image.image_name)
     path = (directory / filename).resolve()
     try:
@@ -228,7 +243,7 @@ def resolve_image_file(folder: CaptureFolder, image: CaptureImage, thumbnail: bo
     directory_value = folder.thumbnail_path if thumbnail else folder.folder_path
     if not directory_value:
         raise BusinessError(ApiCodes.NOT_FOUND, "图片目录未配置", 404)
-    directory = Path(directory_value).expanduser().resolve()
+    directory = to_local(directory_value).resolve()
     filename = safe_filename(image.image_name)
     path = (directory / filename).resolve()
     try:
@@ -569,11 +584,30 @@ def ensure_editable_work_path(folder: CaptureFolder, user_id: str, image_id: int
     ), image.image_name
 
 
-def validate_tif_filename(filename: str | None) -> str:
+def validate_upload_filename(filename: str | None) -> str:
+    """Extension gate for Replace/Insert. Content is checked separately."""
     name = safe_filename(filename or "")
-    if Path(name).suffix.lower() not in {".tif", ".tiff"}:
-        raise BusinessError(ApiCodes.BAD_REQUEST, "Replace/Insert 只支持 .tif/.tiff 文件", 400)
+    if Path(name).suffix.lower() not in UPLOAD_IMAGE_EXTENSIONS:
+        allowed = "/".join(sorted(UPLOAD_IMAGE_EXTENSIONS))
+        raise BusinessError(
+            ApiCodes.BAD_REQUEST, f"Replace/Insert 只支持 {allowed} 文件", 400
+        )
     return name
+
+
+def replacement_image_name(existing_name: str, upload_name: str) -> str:
+    """The name a replaced official image keeps.
+
+    Page identity is the filename (see MODULE_1_QC_REWORK_DESIGN: "image_name =
+    identity", and a recapture keeps the same one), so the stem is preserved and
+    ordering with it. The extension follows the uploaded file, because keeping
+    `.tif` on PNG bytes would leave a file whose name contradicts its content.
+    """
+    existing_suffix = Path(existing_name).suffix.lower()
+    upload_suffix = Path(upload_name).suffix.lower()
+    if existing_suffix == upload_suffix:
+        return existing_name
+    return f"{Path(existing_name).stem}{upload_suffix}"
 
 
 def save_upload_to_temp(folder_id: int, user_id: str, file: UploadFile, filename: str) -> Path:
@@ -583,6 +617,16 @@ def save_upload_to_temp(folder_id: int, user_id: str, file: UploadFile, filename
     target.relative_to(draft_dir(folder_id, user_id).resolve())
     with target.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+    # The extension is caller-supplied, so it proves nothing about the bytes.
+    # Every later step (rotate, crop, thumbnail, commit) assumes a real image,
+    # so reject anything Pillow can't parse here rather than letting a corrupt
+    # file reach the official folder.
+    try:
+        with Image.open(target) as probe:
+            probe.verify()
+    except Exception as error:
+        target.unlink(missing_ok=True)
+        raise BusinessError(ApiCodes.BAD_REQUEST, "上传的文件不是有效图片", 400) from error
     return target
 
 
@@ -611,13 +655,30 @@ def deleted_root(folder_id: int, user_id: str) -> Path:
     return path
 
 
+def child_group_id(parent_group_id: str | None, index: int) -> str | None:
+    """The `group_id` for child folder [index] of a Separation split (1-based).
+
+    `capture_folders.group_id` carries a UNIQUE constraint, so children cannot
+    inherit the parent's value verbatim: the second child would collide, and the
+    parent is only soft-deleted so its row still holds the original. Splitting it
+    with the same `_001`/`_002` suffix `folder_name` already uses keeps the two
+    columns in step.
+
+    A parent with no group_id yields None for every child — PostgreSQL treats
+    NULLs as distinct under a plain UNIQUE, so those never collide.
+    """
+    if parent_group_id is None or not parent_group_id.strip():
+        return None
+    return f"{parent_group_id}_{index:03d}"
+
+
 def unique_official_name(folder: CaptureFolder, preferred_name: str, existing_names: set[str]) -> str:
     preferred = safe_filename(preferred_name)
     stem = Path(preferred).stem
     suffix = Path(preferred).suffix or ".tif"
     candidate = preferred
     index = 1
-    official_dir = Path(folder.folder_path or "").expanduser().resolve()
+    official_dir = to_local(folder.folder_path or "").resolve()
     while candidate in existing_names or (official_dir / candidate).exists():
         candidate = f"{stem}_{index}{suffix}"
         index += 1
@@ -670,8 +731,8 @@ def apply_separation_commit(
         for group in groups
     ]
     file_transaction = SeparationFileTransaction(
-        Path(folder.folder_path),
-        Path(folder.thumbnail_path) if folder.thumbnail_path else None,
+        to_local(folder.folder_path),
+        to_local(folder.thumbnail_path) if folder.thumbnail_path else None,
         grouped_names,
     )
     file_transaction.apply()
@@ -680,7 +741,7 @@ def apply_separation_commit(
         for index, group in enumerate(groups, start=1):
             file_group = file_transaction.groups[index - 1]
             child = CaptureFolder(
-                group_id=folder.group_id,
+                group_id=child_group_id(folder.group_id, index),
                 folder_name=f"{folder.folder_name}_{index:03d}",
                 box_id=folder.box_id,
                 device_id=folder.device_id,
@@ -708,9 +769,10 @@ def apply_separation_commit(
                 is_deskewed=folder.is_deskewed,
                 is_cropped=folder.is_cropped,
                 is_created_thumbnail=folder.is_created_thumbnail,
-                folder_path=str(file_group.final_image_dir),
+                # Written back in LWCAM's own path form — LWCAM and LWIP read these.
+                folder_path=to_db(file_group.final_image_dir),
                 thumbnail_path=(
-                    str(file_group.final_thumbnail_dir)
+                    to_db(file_group.final_thumbnail_dir)
                     if file_group.final_thumbnail_dir
                     else None
                 ),
@@ -757,11 +819,11 @@ def commit_current_draft(
     has_metadata_changes = metadata_dirty_from_manifest(manifest)
     committed: list[CaptureImage] = []
     id_map: dict[int, int] = {}
-    folder_path = Path(folder.folder_path or "").expanduser().resolve()
+    folder_path = to_local(folder.folder_path or "").resolve()
     if not folder_path.is_dir():
         raise ValueError("Folder official image directory is missing")
     existing_names = {image.image_name for image in folder.images}
-    thumbnail_dir = Path(folder.thumbnail_path).expanduser().resolve() if folder.thumbnail_path else None
+    thumbnail_dir = to_local(folder.thumbnail_path).resolve() if folder.thumbnail_path else None
     if thumbnail_dir:
         thumbnail_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1344,13 +1406,13 @@ def replace_image(
     folder = folder_or_404(db, folder_id, current_user.id, lock=True)
     assert_lock_owner(folder, current_user.user_id)
     verify_reviewable_folder(folder, sourceHash)
-    filename = validate_tif_filename(file.filename)
+    filename = validate_upload_filename(file.filename)
     temp_path = save_upload_to_temp(folder.id, current_user.user_id, file, filename)
     if image_id > 0:
         image = next((item for item in folder.images if item.id == image_id), None)
         if image is None:
             raise BusinessError(ApiCodes.NOT_FOUND, "图片不属于当前Folder", 404)
-        image_name = image.image_name if Path(image.image_name).suffix.lower() in {".tif", ".tiff"} else filename
+        image_name = replacement_image_name(image.image_name, filename)
     else:
         item = draft_image_item(read_manifest(folder.id, current_user.user_id), image_id)
         if not item:
@@ -1374,7 +1436,7 @@ def insert_image_before(
     folder = folder_or_404(db, folder_id, current_user.id, lock=True)
     assert_lock_owner(folder, current_user.user_id)
     verify_reviewable_folder(folder, sourceHash)
-    filename = validate_tif_filename(file.filename)
+    filename = validate_upload_filename(file.filename)
     if image_id not in visible_order(read_manifest(folder.id, current_user.user_id), official_image_ids(folder)):
         raise BusinessError(ApiCodes.NOT_FOUND, "插入位置图片不存在", 404)
     temp_path = save_upload_to_temp(folder.id, current_user.user_id, file, filename)
@@ -1613,6 +1675,17 @@ def save_draft(
         if isinstance(error, SeparationFileError):
             raise BusinessError(ApiCodes.BAD_REQUEST, str(error), 400) from error
         raise BusinessError(ApiCodes.BAD_REQUEST, "Draft保存失败", 400) from error
+
+    # The session keeps in-memory values after commit (expire_on_commit=False),
+    # but sourceHash is built from timestamp isoformat() strings — and the
+    # in-memory representation differs from what PostgreSQL hands back on the
+    # next request: TIMESTAMPTZ(3) rounds our microsecond datetimes to
+    # milliseconds, and reads come back in the connection's timezone, not UTC.
+    # Hashing the in-memory values therefore returned a sourceHash no later
+    # request could ever match (409 "Folder已更新" on the very next action).
+    # Expiring forces the VO below to rebuild from persisted values — exactly
+    # the representation every subsequent request will compute against.
+    db.expire_all()
 
     try:
         discard_draft(folder.id, current_user.user_id)

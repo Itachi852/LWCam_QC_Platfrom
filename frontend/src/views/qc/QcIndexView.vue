@@ -5,7 +5,9 @@ import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import AppShell from '@/components/AppShell.vue'
 import ImagePreviewViewer from '@/components/ImagePreviewViewer.vue'
+import ThumbnailImage from '@/components/ThumbnailImage.vue'
 import { qcApi } from '@/api'
+import type { ApiError } from '@/api/client'
 import { usePreviewImage } from '@/composables/usePreviewImage'
 import { translateValue } from '@/i18n'
 import type { CropRect, EditableFolderMetadata, MetadataQcImage, MetadataQcTask, MetadataTemplateField } from '@/types'
@@ -35,14 +37,29 @@ const image = ref<MetadataQcImage | null>(null)
 const viewerVisible = ref(false)
 const rejectDialogVisible = ref(false)
 const metadataDialogVisible = ref(false)
-const cropDialogVisible = ref(false)
 const cropLoading = ref(false)
 const cropImageEl = ref<HTMLImageElement | null>(null)
 const replaceInputEl = ref<HTMLInputElement | null>(null)
 const insertInputEl = ref<HTMLInputElement | null>(null)
-const cropDragging = ref(false)
-const cropStart = ref({ x: 0, y: 0 })
+// In-place crop mode on the main preview. The overlay is an absolutely
+// positioned box glued to the measured img rect (the img itself is left
+// untouched — re-parenting it would break its max-height:100% sizing against
+// the flex canvas). Overlay-local coords == displayed-image coords, which is
+// what clampCropPoint / cropRectInNaturalPixels already assume.
+const cropMode = ref(false)
+const previewCanvasEl = ref<HTMLDivElement | null>(null)
+const cropOverlayBox = reactive({ left: 0, top: 0, width: 0, height: 0 })
 const cropSelection = reactive({ x: 0, y: 0, width: 0, height: 0 })
+type CropHandle = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w'
+const CROP_HANDLES: CropHandle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
+const CROP_MIN = 8
+const cropDrag = ref<null | {
+  kind: 'draw' | 'move' | 'resize'
+  handle?: CropHandle
+  start: { x: number; y: number }
+  orig: { x: number; y: number; width: number; height: number }
+}>(null)
+let cropResizeObserver: ResizeObserver | null = null
 const showMoreImageTools = ref(false)
 const rejectedImageIds = ref<number[]>([])
 const rejectReasons = reactive<Record<number, string>>({})
@@ -99,8 +116,8 @@ const metadataGroups = computed(() => {
         [t('qc.fields.archivalRefNo'), metadata.archivalRefNo],
         [t('qc.fields.coverTag'), metadata.coverTag],
         [t('qc.fields.imageTags'), metadata.imageTags],
-        [t('qc.fields.startDate'), metadata.startDate],
-        [t('qc.fields.endDate'), metadata.endDate],
+        [t('qc.fields.startDate'), canonicalDateValue(metadata.startDate)],
+        [t('qc.fields.endDate'), canonicalDateValue(metadata.endDate)],
       ],
     },
     {
@@ -138,7 +155,10 @@ const selectedBatchIds = computed(() => selectedImageIds.value.filter((id) => ba
 const batchSelectionLabel = computed(() => `${selectedBatchIds.value.length} / ${batchableImageIds.value.length}`)
 const separationMarkerIds = computed(() => current.value?.images.filter((item) => item.separationStart).map((item) => item.id) || [])
 
-const requiredMetadataKeys: Array<keyof EditableFolderMetadata> = [
+// The fields shown in the metadata panel/dialog. Whether each one is REQUIRED
+// comes from the template (the backend ships archivalRefNo as optional), not
+// from membership in this list.
+const editableMetadataKeys: Array<keyof EditableFolderMetadata> = [
   'coverTag',
   'title',
   'volume',
@@ -147,29 +167,31 @@ const requiredMetadataKeys: Array<keyof EditableFolderMetadata> = [
   'archivalRefNo',
 ]
 
-function fallbackRequiredField(key: keyof EditableFolderMetadata): MetadataTemplateField {
-  const fieldLabelKeys: Partial<Record<keyof EditableFolderMetadata, string>> = {
-    coverTag: 'coverTag',
-    title: 'title',
-    volume: 'volume',
-    startDate: 'startDate',
-    endDate: 'endDate',
-    archivalRefNo: 'archivalRefNo',
-  }
+// Mirrors the backend DEFAULT_METADATA_TEMPLATE for folders without one.
+const fallbackMandatoryByKey: Partial<Record<keyof EditableFolderMetadata, boolean>> = {
+  coverTag: true,
+  title: true,
+  volume: true,
+  startDate: true,
+  endDate: true,
+  archivalRefNo: false,
+}
+
+function fallbackEditableField(key: keyof EditableFolderMetadata): MetadataTemplateField {
   return {
     key,
-    label: t(`qc.fields.${fieldLabelKeys[key] || key}`),
+    label: t(`qc.fields.${key}`),
     input: 'text',
-    mandatory: true,
+    mandatory: fallbackMandatoryByKey[key] ?? true,
     exported: true,
     options: [],
   }
 }
 
 const editableTemplateFields = computed<MetadataTemplateField[]>(() =>
-  requiredMetadataKeys.map((key) => {
+  editableMetadataKeys.map((key) => {
     const templateField = current.value?.metadataTemplate.fields.find((field) => field.key === key)
-    return templateField ? { ...templateField, mandatory: true } : fallbackRequiredField(key)
+    return templateField ? { ...templateField } : fallbackEditableField(key)
   }),
 )
 
@@ -193,7 +215,16 @@ const metadataPayloadKeys: Array<keyof EditableFolderMetadata> = [
 const metadataDirty = computed(() => {
   const metadata = current.value?.metadata
   if (!metadata) return false
-  return metadataPayloadKeys.some((key) => normalizeMetadataValue(metadataForm[key]) !== normalizeMetadataValue(metadata[key]))
+  return metadataPayloadKeys.some((key) => {
+    // Compare dates in canonical form: the form holds '<year>-01-01T00:00:00Z'
+    // while the API returns PostgreSQL's offset (e.g. '+07:20'), so a raw string
+    // compare would report every folder as permanently unsaved.
+    if (isDateFieldKey(key)) {
+      return normalizeMetadataValue(canonicalDateValue(metadataForm[key])) !==
+        normalizeMetadataValue(canonicalDateValue(metadata[key]))
+    }
+    return normalizeMetadataValue(metadataForm[key]) !== normalizeMetadataValue(metadata[key])
+  })
 })
 
 function applyTaskUpdate(task: MetadataQcTask, selectedImageId?: number | null) {
@@ -208,11 +239,28 @@ function applyTaskUpdate(task: MetadataQcTask, selectedImageId?: number | null) 
   if (listIndex >= 0) tasks.value[listIndex] = visibleTask
 }
 
-function optionValue(field: MetadataTemplateField, option: string) {
-  if ((field.key === 'startDate' || field.key === 'endDate') && /^\d{4}$/.test(option)) {
-    return `${option}-01-01T00:00:00Z`
-  }
-  return option
+function isDateFieldKey(key: string) {
+  return key === 'startDate' || key === 'endDate'
+}
+
+/**
+ * The value a date field holds in the form: a bare year, e.g. '1939'.
+ *
+ * Dates are keyed as years — the template offers years as options, and when the
+ * folder's template omits the field it falls back to a plain text input. The API
+ * returns what PostgreSQL stores, offset and all ('1939-01-01T00:00:00+07:20',
+ * since Asia/Singapore ran on +07:20 that year), which rendered as an unmatched
+ * select option (blank) or as that raw string in a text box.
+ *
+ * The year comes from the leading digits and NOT from a UTC conversion:
+ * 1939-01-01T00:00:00+07:20 in UTC is 1938-12-31, which would show 1938. The two
+ * fields don't even share an offset — 1945 is stored at +09 — so nothing
+ * offset-based is consistent. The backend coerces a 4-digit year back to a
+ * datetime (metadata_date), so a year is a valid value to send.
+ */
+function canonicalDateValue(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null
+  return /^(\d{4})/.exec(value.trim())?.[1] ?? value
 }
 
 function displayOption(option: string) {
@@ -243,7 +291,11 @@ function hasMetadataValue(value: unknown) {
 }
 
 function requiredMissingFromMetadata(metadata: Record<string, unknown>) {
-  return editableTemplateFields.value.filter((field) => !hasMetadataValue(metadata[field.key]))
+  // Only mandatory fields block save/approve — archivalRefNo is shown here but
+  // the template marks it optional.
+  return editableTemplateFields.value.filter(
+    (field) => field.mandatory && !hasMetadataValue(metadata[field.key]),
+  )
 }
 
 function requiredMissingFromForm() {
@@ -386,7 +438,13 @@ async function claimNext() {
     await router.push({ name: 'qc-review', params: { id: data.data.id } })
     return true
   } catch (error) {
-    ElMessage.error((error as Error).message)
+    // An empty queue is the normal end of a review session — after approving
+    // the last folder there is nothing left to claim. Not an error.
+    if ((error as ApiError).status === 404) {
+      ElMessage.info(t('qc.noMoreTasks'))
+    } else {
+      ElMessage.error((error as Error).message)
+    }
     return false
   } finally {
     detailLoading.value = false
@@ -412,8 +470,14 @@ async function promptNextTaskOrClose() {
       distinguishCancelAndClose: false,
     })
     const claimed = await claimNext()
-    if (!claimed) await router.push('/qc/my-tasks')
+    if (!claimed) {
+      // The desk renders whenever `current` is set — leaving the approved
+      // folder in it made the UI look like the approval hadn't happened.
+      clearCurrentTask()
+      await router.push('/qc/my-tasks')
+    }
   } catch {
+    clearCurrentTask()
     await router.push('/qc/my-tasks')
   }
 }
@@ -500,8 +564,10 @@ function fillMetadataFormFromCurrent() {
     imageTags: metadata.imageTags ?? null,
     title: metadata.title ?? null,
     volume: metadata.volume ?? null,
-    startDate: metadata.startDate ?? null,
-    endDate: metadata.endDate ?? null,
+    // Canonicalized so the year matches an option and renders — see
+    // canonicalDateValue.
+    startDate: canonicalDateValue(metadata.startDate),
+    endDate: canonicalDateValue(metadata.endDate),
     archivalRefNo: metadata.archivalRefNo ?? null,
     recordType: metadata.recordType ?? null,
     place: metadata.place ?? null,
@@ -573,6 +639,7 @@ async function handleVersionOrActionError(error: unknown) {
 }
 
 function openViewer() {
+  if (cropMode.value) return // the overlay blocks clicks anyway — insurance
   if (previewSrc.value) viewerVisible.value = true
 }
 
@@ -583,10 +650,63 @@ function resetCropSelection() {
   cropSelection.height = 0
 }
 
-function openCropDialog() {
-  if (current.value?.status !== 'reviewing' || !image.value?.available || !previewSrc.value) return
+const canCrop = computed(
+  () => current.value?.status === 'reviewing' && !!image.value?.available && !!previewSrc.value,
+)
+
+function toggleCropMode() {
+  if (cropMode.value) exitCropMode()
+  else enterCropMode()
+}
+
+function enterCropMode() {
+  // naturalWidth === 0 means the img hasn't decoded yet — the natural-px
+  // conversion would produce garbage, so refuse until @load re-enables us.
+  if (!canCrop.value || !cropImageEl.value || cropImageEl.value.naturalWidth === 0) return
   resetCropSelection()
-  cropDialogVisible.value = true
+  syncCropOverlayBox()
+  cropMode.value = true
+  cropResizeObserver = new ResizeObserver(syncCropOverlayBox)
+  if (previewCanvasEl.value) cropResizeObserver.observe(previewCanvasEl.value)
+  window.addEventListener('keydown', onCropKeydown)
+}
+
+function exitCropMode() {
+  cropMode.value = false
+  stopCropDrag()
+  resetCropSelection()
+  cropResizeObserver?.disconnect()
+  cropResizeObserver = null
+  window.removeEventListener('keydown', onCropKeydown)
+}
+
+function onCropKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') exitCropMode()
+}
+
+/** Glue the overlay to the rendered img box (letterboxed by object-fit within
+ *  the flex canvas), and keep an existing selection proportionally in place
+ *  when the box resizes (window resize, sidebar collapse, responsive reflow). */
+function syncCropOverlayBox() {
+  const img = cropImageEl.value
+  const canvas = previewCanvasEl.value
+  if (!img || !canvas) return
+  const imgRect = img.getBoundingClientRect()
+  const canvasRect = canvas.getBoundingClientRect()
+  const prevWidth = cropOverlayBox.width
+  const prevHeight = cropOverlayBox.height
+  cropOverlayBox.left = imgRect.left - canvasRect.left
+  cropOverlayBox.top = imgRect.top - canvasRect.top
+  cropOverlayBox.width = imgRect.width
+  cropOverlayBox.height = imgRect.height
+  if (hasCropSelection.value && prevWidth > 0 && prevHeight > 0 && (prevWidth !== imgRect.width || prevHeight !== imgRect.height)) {
+    const fx = imgRect.width / prevWidth
+    const fy = imgRect.height / prevHeight
+    cropSelection.x *= fx
+    cropSelection.width *= fx
+    cropSelection.y *= fy
+    cropSelection.height *= fy
+  }
 }
 
 function clampCropPoint(event: PointerEvent) {
@@ -599,30 +719,89 @@ function clampCropPoint(event: PointerEvent) {
   }
 }
 
-function startCrop(event: PointerEvent) {
+function normalizedSelection() {
+  return {
+    x: Math.min(cropSelection.x, cropSelection.x + cropSelection.width),
+    y: Math.min(cropSelection.y, cropSelection.y + cropSelection.height),
+    width: Math.abs(cropSelection.width),
+    height: Math.abs(cropSelection.height),
+  }
+}
+
+function beginCropDrag(kind: 'draw' | 'move' | 'resize', event: PointerEvent, handle?: CropHandle) {
   event.preventDefault()
+  cropDrag.value = { kind, handle, start: clampCropPoint(event), orig: normalizedSelection() }
+  window.addEventListener('pointermove', onCropDragMove)
+  window.addEventListener('pointerup', stopCropDrag)
+}
+
+function startCropDraw(event: PointerEvent) {
   const point = clampCropPoint(event)
-  cropDragging.value = true
-  cropStart.value = point
   cropSelection.x = point.x
   cropSelection.y = point.y
   cropSelection.width = 0
   cropSelection.height = 0
-  window.addEventListener('pointermove', updateCrop)
-  window.addEventListener('pointerup', stopCrop)
+  beginCropDrag('draw', event)
 }
 
-function updateCrop(event: PointerEvent) {
-  if (!cropDragging.value) return
+function startCropMove(event: PointerEvent) {
+  beginCropDrag('move', event)
+}
+
+function startCropResize(handle: CropHandle, event: PointerEvent) {
+  beginCropDrag('resize', event, handle)
+}
+
+function onCropDragMove(event: PointerEvent) {
+  const drag = cropDrag.value
+  const img = cropImageEl.value
+  if (!drag || !img) return
   const point = clampCropPoint(event)
-  cropSelection.width = point.x - cropStart.value.x
-  cropSelection.height = point.y - cropStart.value.y
+  const rect = img.getBoundingClientRect()
+  const dx = point.x - drag.start.x
+  const dy = point.y - drag.start.y
+
+  if (drag.kind === 'draw') {
+    cropSelection.width = point.x - drag.start.x
+    cropSelection.height = point.y - drag.start.y
+    return
+  }
+  if (drag.kind === 'move') {
+    cropSelection.x = Math.min(rect.width - drag.orig.width, Math.max(0, drag.orig.x + dx))
+    cropSelection.y = Math.min(rect.height - drag.orig.height, Math.max(0, drag.orig.y + dy))
+    cropSelection.width = drag.orig.width
+    cropSelection.height = drag.orig.height
+    return
+  }
+  // resize — edge model; a corner handle hits two branches. Edges pin at
+  // CROP_MIN so the frame can't flip through itself.
+  const handle = drag.handle ?? 'se'
+  let left = drag.orig.x
+  let top = drag.orig.y
+  let right = left + drag.orig.width
+  let bottom = top + drag.orig.height
+  if (handle.includes('w')) left = Math.min(right - CROP_MIN, Math.max(0, drag.orig.x + dx))
+  if (handle.includes('e')) right = Math.max(left + CROP_MIN, Math.min(rect.width, drag.orig.x + drag.orig.width + dx))
+  if (handle.includes('n')) top = Math.min(bottom - CROP_MIN, Math.max(0, drag.orig.y + dy))
+  if (handle.includes('s')) bottom = Math.max(top + CROP_MIN, Math.min(rect.height, drag.orig.y + drag.orig.height + dy))
+  cropSelection.x = left
+  cropSelection.y = top
+  cropSelection.width = right - left
+  cropSelection.height = bottom - top
 }
 
-function stopCrop() {
-  cropDragging.value = false
-  window.removeEventListener('pointermove', updateCrop)
-  window.removeEventListener('pointerup', stopCrop)
+function stopCropDrag() {
+  const wasDraw = cropDrag.value?.kind === 'draw'
+  cropDrag.value = null
+  window.removeEventListener('pointermove', onCropDragMove)
+  window.removeEventListener('pointerup', stopCropDrag)
+  if (wasDraw) {
+    if (!hasCropSelection.value) {
+      resetCropSelection() // a stray click leaves no selection
+    } else {
+      Object.assign(cropSelection, normalizedSelection())
+    }
+  }
 }
 
 function cropRectInNaturalPixels(): CropRect | null {
@@ -663,15 +842,13 @@ async function submitCrop() {
       current.value.sourceHash,
       rect,
     )
-    current.value = data.data
-    claimedTask.value = data.data
-    const listIndex = tasks.value.findIndex((task) => task.id === data.data.id)
-    if (listIndex >= 0) tasks.value[listIndex] = data.data
-    image.value = data.data.images.find((item) => item.id === selectedImageId) || data.data.images[0] || null
-    cropDialogVisible.value = false
+    // Same path as every other image action — gains the deleted-image
+    // filtering and selection pruning the old manual sync skipped.
+    applyTaskUpdate(data.data, selectedImageId)
+    exitCropMode()
     ElMessage.success(t('qc.cropSaved'))
   } catch (error) {
-    cropDialogVisible.value = false
+    exitCropMode()
     await handleVersionOrActionError(error)
   } finally {
     cropLoading.value = false
@@ -693,6 +870,28 @@ function selectAllBatchImages() {
 
 function clearBatchSelection() {
   selectedImageIds.value = []
+}
+
+function onThumbnailClick(item: MetadataQcImage, index: number, event: MouseEvent) {
+  const reviewing = current.value?.status === 'reviewing'
+  if (reviewing && event.shiftKey && current.value) {
+    // Range-select between the ACTIVE image and the clicked one (active image
+    // itself stays where it is — shift+click only extends the batch selection).
+    const anchorIndex = current.value.images.findIndex((entry) => entry.id === image.value?.id)
+    const from = anchorIndex >= 0 ? Math.min(anchorIndex, index) : index
+    const to = anchorIndex >= 0 ? Math.max(anchorIndex, index) : index
+    const rangeIds = current.value.images
+      .slice(from, to + 1)
+      .map((entry) => entry.id)
+      .filter((id) => batchableImageIds.value.includes(id))
+    selectedImageIds.value = [...new Set([...selectedImageIds.value, ...rangeIds])]
+    return
+  }
+  if (reviewing && (event.ctrlKey || event.metaKey)) {
+    toggleImageSelection(item.id, !selectedBatchIds.value.includes(item.id))
+    return
+  }
+  image.value = item
 }
 
 function syncRejectReasons(ids: number[]) {
@@ -740,8 +939,10 @@ async function applyLuminanceBatch() {
   }
 }
 
-function isTifFile(file: File) {
-  return /\.(tif|tiff)$/i.test(file.name)
+// Keep in step with UPLOAD_IMAGE_EXTENSIONS in backend/app/routers/qc.py — the
+// backend re-checks this and also verifies the bytes are a real image.
+function isSupportedImageFile(file: File) {
+  return /\.(jpe?g|png|tiff?)$/i.test(file.name)
 }
 
 function triggerReplaceUpload() {
@@ -759,8 +960,8 @@ async function handleReplaceUpload(event: Event) {
   const file = target.files?.[0]
   target.value = ''
   if (!file || current.value?.status !== 'reviewing' || !image.value) return
-  if (!isTifFile(file)) {
-    ElMessage.warning(t('qc.tifOnly'))
+  if (!isSupportedImageFile(file)) {
+    ElMessage.warning(t('qc.imageTypeOnly'))
     return
   }
   actionLoading.value = true
@@ -781,8 +982,8 @@ async function handleInsertUpload(event: Event) {
   const file = target.files?.[0]
   target.value = ''
   if (!file || current.value?.status !== 'reviewing' || !image.value) return
-  if (!isTifFile(file)) {
-    ElMessage.warning(t('qc.tifOnly'))
+  if (!isSupportedImageFile(file)) {
+    ElMessage.warning(t('qc.imageTypeOnly'))
     return
   }
   actionLoading.value = true
@@ -1012,9 +1213,16 @@ watch(
   },
 )
 
+// previewSrc changes on image switch, rotate/undo/redo/luminance/restore, and
+// task refresh — any of which invalidates an in-progress crop frame. Exiting
+// here means no per-button disabling is needed anywhere else.
+watch([previewSrc, () => current.value?.status], () => {
+  if (cropMode.value) exitCropMode()
+})
+
 onMounted(refreshForRoute)
 onBeforeUnmount(() => {
-  stopCrop()
+  exitCropMode()
   if (claimedTask.value?.status === 'reviewing') {
     void qcApi.release(claimedTask.value.id).catch(() => undefined)
   }
@@ -1112,8 +1320,12 @@ onBeforeUnmount(() => {
               class="qc-thumbnail"
               :class="{ active: image?.id === item.id, selected: selectedBatchIds.includes(item.id), unavailable: !item.available }"
               :title="item.filename"
-              @click="image = item"
+              @click="onThumbnailClick(item, index, $event)"
             >
+              <span class="qc-thumbnail-preview">
+                <el-icon v-if="!item.available"><WarningFilled /></el-icon>
+                <ThumbnailImage v-else :src="item.previewUrl" :alt="item.filename" />
+              </span>
               <el-checkbox
                 v-if="current.status === 'reviewing'"
                 class="qc-thumbnail-check"
@@ -1123,13 +1335,12 @@ onBeforeUnmount(() => {
                 @change="(checked: boolean) => toggleImageSelection(item.id, checked)"
               />
               <span class="qc-thumbnail-index">{{ String(index + 1).padStart(2, '0') }}</span>
-              <span class="qc-thumbnail-preview">
-                <el-icon v-if="!item.available"><WarningFilled /></el-icon>
-                <el-icon v-else><Document /></el-icon>
+              <span
+                v-if="current.draftImageIds.includes(item.id) || item.draftState"
+                class="qc-thumbnail-unsaved"
+              >
+                {{ t('qc.unsavedBadge') }}
               </span>
-              <span class="qc-thumbnail-name">{{ item.filename }}</span>
-              <span v-if="current.draftImageIds.includes(item.id)" class="qc-draft-flag">{{ t('qc.draftUnsaved') }}</span>
-              <span v-if="item.draftState" class="qc-draft-state">{{ item.draftState }}</span>
               <el-button
                 v-if="current.status === 'reviewing' && separationMode"
                 class="qc-separation-dot"
@@ -1146,13 +1357,63 @@ onBeforeUnmount(() => {
 
         <section v-loading="detailLoading || previewLoading" class="qc-preview-stage">
           <template v-if="image">
-            <div class="qc-preview-canvas">
-              <img v-if="previewSrc" class="qc-main-image" :src="previewSrc" :alt="image.filename" @click="openViewer" />
+            <div ref="previewCanvasEl" class="qc-preview-canvas">
+              <img
+                v-if="previewSrc"
+                ref="cropImageEl"
+                class="qc-main-image"
+                :src="previewSrc"
+                :alt="image.filename"
+                @load="syncCropOverlayBox"
+                @click="openViewer"
+              />
               <el-alert v-else-if="!image.available" type="error" :closable="false" :title="t('qc.imageMissing')" />
               <span v-else-if="previewError" class="error-message">{{ previewError }}</span>
+              <div
+                v-if="cropMode"
+                class="qc-crop-overlay"
+                :style="{
+                  left: `${cropOverlayBox.left}px`,
+                  top: `${cropOverlayBox.top}px`,
+                  width: `${cropOverlayBox.width}px`,
+                  height: `${cropOverlayBox.height}px`,
+                }"
+                @pointerdown="startCropDraw"
+              >
+                <div
+                  v-if="hasCropSelection"
+                  class="crop-selection"
+                  :style="cropSelectionStyle"
+                  @pointerdown.stop="startCropMove"
+                >
+                  <span
+                    v-for="handle in CROP_HANDLES"
+                    :key="handle"
+                    class="crop-handle"
+                    :class="`crop-handle--${handle}`"
+                    @pointerdown.stop="startCropResize(handle, $event)"
+                  />
+                </div>
+              </div>
+            </div>
+            <div v-if="cropMode" class="qc-crop-bar">
+              <span class="qc-crop-bar__hint">{{ t('qc.cropHint') }}</span>
+              <el-button size="small" @click="exitCropMode">{{ t('common.cancel') }}</el-button>
+              <el-button size="small" :disabled="!hasCropSelection" @click="resetCropSelection">
+                {{ t('common.reset') }}
+              </el-button>
+              <el-button
+                size="small"
+                type="primary"
+                :loading="cropLoading"
+                :disabled="!hasCropSelection"
+                @click="submitCrop"
+              >
+                {{ t('qc.confirmCrop') }}
+              </el-button>
             </div>
             <button
-              v-if="currentImageIndex > 1"
+              v-if="currentImageIndex > 1 && !cropMode"
               class="qc-nav-button qc-nav-button--prev"
               @click="image = current.images[currentImageIndex - 2]"
               :title="t('common.previous')"
@@ -1160,7 +1421,7 @@ onBeforeUnmount(() => {
               <el-icon><ArrowLeft /></el-icon>
             </button>
             <button
-              v-if="currentImageIndex < current.imageCount"
+              v-if="currentImageIndex < current.imageCount && !cropMode"
               class="qc-nav-button qc-nav-button--next"
               @click="image = current.images[currentImageIndex]"
               :title="t('common.next')"
@@ -1172,6 +1433,16 @@ onBeforeUnmount(() => {
         </section>
 
         <aside class="qc-review-panel">
+          <!-- Always rendered: the panel's grid rows are positional, so a
+               conditional first card would shift the other two into the wrong
+               rows the moment no image is selected. -->
+          <section class="qc-info-card qc-current-image-card">
+            <div class="qc-panel-heading">
+              <span>{{ t('qc.currentImage') }}</span>
+              <strong>{{ image ? `${currentImageIndex} / ${current.imageCount}` : '–' }}</strong>
+            </div>
+            <p class="qc-current-image-name">{{ image ? image.filename : t('qc.selectImage') }}</p>
+          </section>
           <section class="qc-comment-card">
             <div class="qc-comment-box">
               <p>{{ t('qc.rejectReason') }}</p>
@@ -1227,7 +1498,7 @@ onBeforeUnmount(() => {
                     v-for="option in field.options"
                     :key="option"
                     :label="displayOption(option)"
-                    :value="optionValue(field, option)"
+                    :value="option"
                   />
                 </el-select>
                 <el-input v-else-if="field.input === 'fixed'" :model-value="field.value || ''" readonly />
@@ -1248,17 +1519,25 @@ onBeforeUnmount(() => {
               </el-button>
             </div>
           </section>
+
         </aside>
 
         <footer class="qc-tool-strip" :class="{ 'qc-tool-strip--english': locale === 'en-US' }">
-          <input ref="replaceInputEl" class="hidden-file-input" type="file" accept=".tif,.tiff" @change="handleReplaceUpload" />
-          <input ref="insertInputEl" class="hidden-file-input" type="file" accept=".tif,.tiff" @change="handleInsertUpload" />
+          <input ref="replaceInputEl" class="hidden-file-input" type="file" accept=".jpg,.jpeg,.png,.tif,.tiff" @change="handleReplaceUpload" />
+          <input ref="insertInputEl" class="hidden-file-input" type="file" accept=".jpg,.jpeg,.png,.tif,.tiff" @change="handleInsertUpload" />
           <div class="qc-tool-row">
             <template v-if="current.status === 'reviewing'">
               <el-button :icon="'Upload'" :loading="actionLoading" @click="triggerReplaceUpload">{{ t('qc.replaceImage') }}</el-button>
               <el-button :icon="'Plus'" :loading="actionLoading" @click="triggerInsertUpload">{{ t('qc.insertBefore') }}</el-button>
               <el-button :icon="'Delete'" :loading="actionLoading" @click="deleteCurrentImage">{{ t('common.delete') }}</el-button>
-              <el-button v-if="image?.available" :icon="'Crop'" @click="openCropDialog">{{ t('qc.cropImage') }}</el-button>
+              <el-button
+                v-if="image?.available"
+                :icon="'Crop'"
+                :type="cropMode ? 'primary' : 'default'"
+                @click="toggleCropMode"
+              >
+                {{ t('qc.cropImage') }}
+              </el-button>
               <el-button :icon="'RefreshLeft'" :loading="actionLoading" @click="rotateCurrent(-90)">{{ t('qc.rotateLeft') }}</el-button>
               <el-button :icon="'RefreshRight'" :loading="actionLoading" @click="rotateCurrent(90)">{{ t('qc.rotateRight') }}</el-button>
               <el-button :loading="actionLoading" @click="undoDraftAction">{{ t('qc.undo') }}</el-button>
@@ -1484,7 +1763,7 @@ onBeforeUnmount(() => {
               v-for="option in field.options"
               :key="option"
               :label="displayOption(option)"
-              :value="optionValue(field, option)"
+              :value="option"
             />
           </el-select>
           <el-input v-else-if="field.input === 'fixed'" :model-value="field.value || ''" readonly />
@@ -1497,32 +1776,6 @@ onBeforeUnmount(() => {
       <template #footer>
         <el-button @click="metadataDialogVisible = false">{{ t('common.cancel') }}</el-button>
         <el-button type="primary" :loading="metadataSaving" @click="saveMetadata">{{ t('common.save') }}</el-button>
-      </template>
-    </el-dialog>
-
-    <el-dialog v-model="cropDialogVisible" :title="t('qc.cropImage')" width="min(1120px, 96vw)" class="crop-dialog" @closed="resetCropSelection">
-      <div class="crop-workspace">
-        <div class="crop-stage">
-          <div v-if="previewSrc" class="crop-image-wrap">
-            <img
-              ref="cropImageEl"
-              class="crop-image"
-              :src="previewSrc"
-              :alt="image?.filename"
-              draggable="false"
-              @pointerdown="startCrop"
-            />
-            <div v-if="hasCropSelection" class="crop-selection" :style="cropSelectionStyle" />
-          </div>
-        </div>
-        <p class="crop-hint">{{ t('qc.cropHint') }}</p>
-      </div>
-      <template #footer>
-        <el-button @click="cropDialogVisible = false">{{ t('common.cancel') }}</el-button>
-        <el-button @click="resetCropSelection">{{ t('common.reset') }}</el-button>
-        <el-button type="primary" :loading="cropLoading" :disabled="!hasCropSelection" @click="submitCrop">
-          {{ t('qc.confirmCrop') }}
-        </el-button>
       </template>
     </el-dialog>
 
@@ -1606,48 +1859,16 @@ onBeforeUnmount(() => {
   line-height: 1;
 }
 
-:global(.crop-dialog .el-dialog__body) {
-  padding-top: 8px;
+/* In-place crop mode. The overlay is glued to the measured img rect, so its
+   local coordinate space IS the displayed image; overflow:hidden clips the
+   selection's 9999px shade (the dialog's body used to do that job). */
+.qc-crop-overlay {
+  position: absolute;
+  z-index: 5;
   overflow: hidden;
-}
-
-.crop-workspace {
-  display: grid;
-  gap: 12px;
-}
-
-.crop-stage {
-  position: relative;
-  width: 100%;
-  min-height: 220px;
-  max-height: min(62vh, 680px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  overflow: hidden;
-  border: 1px solid #D6DDD6;
-  border-radius: 8px;
-  background: #101612;
-  user-select: none;
-}
-
-.crop-image-wrap {
-  position: relative;
-  display: inline-block;
-  max-width: 100%;
-  line-height: 0;
-}
-
-.crop-image {
-  display: block;
-  max-width: 100%;
-  max-height: min(62vh, 680px);
-  width: auto;
-  height: auto;
-  object-fit: contain;
   cursor: crosshair;
-  user-select: none;
   touch-action: none;
+  user-select: none;
 }
 
 .crop-selection {
@@ -1656,13 +1877,50 @@ onBeforeUnmount(() => {
   border: 2px solid #FFB13B;
   background: rgba(255, 177, 59, 0.18);
   box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.42);
-  pointer-events: none;
+  cursor: move;
+  touch-action: none;
 }
 
-.crop-hint {
-  margin: 0;
-  color: #5A6F66;
+.crop-handle {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  margin: -7px;
+  background: #fff;
+  border: 2px solid #FFB13B;
+  border-radius: 2px;
+  box-sizing: border-box;
+}
+
+.crop-handle--nw { left: 0; top: 0; cursor: nwse-resize; }
+.crop-handle--n  { left: 50%; top: 0; cursor: ns-resize; }
+.crop-handle--ne { left: 100%; top: 0; cursor: nesw-resize; }
+.crop-handle--e  { left: 100%; top: 50%; cursor: ew-resize; }
+.crop-handle--se { left: 100%; top: 100%; cursor: nwse-resize; }
+.crop-handle--s  { left: 50%; top: 100%; cursor: ns-resize; }
+.crop-handle--sw { left: 0; top: 100%; cursor: nesw-resize; }
+.crop-handle--w  { left: 0; top: 50%; cursor: ew-resize; }
+
+.qc-crop-bar {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(16, 22, 18, 0.82);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.28);
+  white-space: nowrap;
+}
+
+.qc-crop-bar__hint {
+  color: #D6DDD6;
   font-size: 13px;
+  margin-right: 4px;
 }
 
 .pending-queue-panel {
@@ -1972,17 +2230,18 @@ onBeforeUnmount(() => {
 }
 
 /* 底部固定操作栏 */
+/* Sized and typed like the el-buttons it sits between (14px / 500 / 4px radius) */
 .draft-status {
   display: inline-flex;
   align-items: center;
   min-height: 32px;
-  padding: 0 10px;
+  padding: 0 15px;
   border: 1px solid #F3D19E;
-  border-radius: 8px;
+  border-radius: 4px;
   background: #FFF7E6;
   color: #B76E00;
-  font-size: 12px;
-  font-weight: 700;
+  font-size: 14px;
+  font-weight: 500;
   white-space: nowrap;
 }
 
@@ -3112,7 +3371,7 @@ onBeforeUnmount(() => {
 .qc-desk {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(170px, 210px) minmax(0, 1fr) minmax(290px, 340px);
+  grid-template-columns: minmax(200px, 248px) minmax(0, 1fr) minmax(290px, 340px);
   grid-template-rows: 58px minmax(0, 1fr) auto;
   height: calc(100vh - 236px);
   max-height: calc(100vh - 236px);
@@ -3273,22 +3532,28 @@ onBeforeUnmount(() => {
   padding: 10px;
   overflow-x: hidden;
   overflow-y: auto;
+  /* shift+click range selection must not highlight filenames */
+  user-select: none;
 }
 
+/* LWCAM image-grid philosophy: the image IS the tile. Checkbox, sequence
+   number, and the unsaved badge float over it; the filename lives in the right
+   panel's "Current image" card, not here. */
 .qc-thumbnail {
   position: relative;
-  display: grid;
-  grid-template-columns: 28px minmax(0, 1fr) 30px;
-  grid-template-rows: 54px auto;
-  gap: 6px 8px;
+  display: block;
   width: 100%;
-  min-height: 92px;
-  padding: 8px;
-  border: 2px solid transparent;
-  border-radius: 6px;
+  /* The list is a column flexbox and flex items SHRINK by default; with
+     overflow:hidden the tile has no automatic minimum, so 12 tiles would be
+     crushed to share the rail height. Never shrink — the list scrolls. */
+  flex: 0 0 auto;
+  padding: 0;
+  border: 3px solid transparent;
+  border-radius: 8px;
   background: #ffffff;
   color: inherit;
   cursor: pointer;
+  overflow: hidden;
   transition: border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease;
 }
 
@@ -3309,10 +3574,9 @@ onBeforeUnmount(() => {
 }
 
 .qc-thumbnail-check {
-  grid-column: 1;
-  grid-row: 1;
-  align-self: start;
-  justify-self: start;
+  position: absolute;
+  top: 6px;
+  left: 6px;
   z-index: 2;
   display: inline-flex;
   width: 24px;
@@ -3328,10 +3592,10 @@ onBeforeUnmount(() => {
 }
 
 .qc-thumbnail-index {
-  grid-column: 3;
-  grid-row: 1;
-  align-self: start;
-  justify-self: end;
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 2;
   padding: 2px 7px;
   border-radius: 4px;
   background: #4d7769;
@@ -3340,59 +3604,50 @@ onBeforeUnmount(() => {
   font-weight: 800;
 }
 
+/* Fills the tile at document ratio (~A4 portrait); contain rather than cover so
+   a rotated or oddly-sized page is still fully visible for judging. */
 .qc-thumbnail-preview {
-  grid-column: 2;
-  grid-row: 1;
   display: flex;
   align-items: center;
   justify-content: center;
-  min-width: 0;
-  min-height: 54px;
-  border-radius: 5px;
+  width: 100%;
+  aspect-ratio: 1 / 1.35;
   background: #f0f2f1;
   color: #9d90b8;
   font-size: 24px;
-}
-
-.qc-thumbnail-name {
-  grid-column: 1 / -1;
-  grid-row: 2;
-  min-width: 0;
   overflow: hidden;
-  color: #607267;
-  font-size: 11px;
-  font-weight: 600;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
-.qc-draft-flag,
-.qc-draft-state {
+/* Solid saffron, not the soft tint — it must read at a glance over any image */
+.qc-thumbnail-unsaved {
   position: absolute;
-  z-index: 3;
-  right: 8px;
-  max-width: calc(100% - 16px);
-  overflow: hidden;
-  padding: 2px 6px;
+  left: 6px;
+  bottom: 6px;
+  z-index: 2;
+  padding: 3px 9px;
   border-radius: 4px;
-  font-size: 10px;
+  background: #ffb347;
+  color: #1a3329;
+  font-size: 12px;
   font-weight: 800;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  letter-spacing: 0.3px;
+  box-shadow: 0 1px 5px rgba(26, 51, 41, 0.35);
 }
 
-.qc-draft-flag {
-  bottom: 28px;
-  background: #fff7e6;
-  color: #b76e00;
+/* "Current image" card in the right panel — full filename, wrapping, since the
+   tiles no longer carry it */
+.qc-current-image-card {
+  border-bottom: 1px solid #d5dbd7;
 }
 
-.qc-draft-state {
-  left: 8px;
-  right: auto;
-  bottom: 28px;
-  background: #e8f3ef;
-  color: #2c5f4f;
+.qc-current-image-name {
+  margin: 0;
+  color: #2f4239;
+  /* matches el-button default text (e.g. "Discard draft") */
+  font-size: 14px;
+  font-weight: 600;
+  word-break: break-all;
+  line-height: 1.5;
 }
 
 .qc-separation-dot {
@@ -3422,6 +3677,9 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   padding: 16px 24px 18px;
+  /* containing block for the crop overlay, which is positioned from the
+     measured img rect relative to this element */
+  position: relative;
 }
 
 .qc-main-image {
@@ -3470,7 +3728,11 @@ onBeforeUnmount(() => {
   grid-row: 2 / 4;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  /* current image | rework reason + draft actions | metadata (scrolls).
+     The template must match the child count: with only two rows, the comment
+     card landed in the stretchy 1fr row (giant Rework box) and the metadata
+     card fell into an implicit row at the bottom. */
+  grid-template-rows: auto auto minmax(0, 1fr);
   gap: 8px;
   overflow: hidden;
   border-left: 1px solid #d5dbd7;
@@ -3811,7 +4073,6 @@ onBeforeUnmount(() => {
 
 .qc-project-title span,
 .qc-rail-summary span,
-.qc-thumbnail-name,
 .qc-panel-heading span,
 .qc-comment-box span,
 .qc-inline-metadata-form :deep(.el-form-item__label),
@@ -3892,14 +4153,9 @@ onBeforeUnmount(() => {
   background: var(--lw-sea-salt);
 }
 
-.qc-draft-flag {
-  background: var(--lw-saffron-soft);
+.qc-thumbnail-unsaved {
+  background: var(--lw-saffron);
   color: var(--lw-dark);
-}
-
-.qc-draft-state {
-  background: var(--lw-green-soft);
-  color: var(--lw-green);
 }
 
 .qc-thumbnail.unavailable {

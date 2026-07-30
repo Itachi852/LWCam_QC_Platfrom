@@ -1,41 +1,77 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import AppShell from '@/components/AppShell.vue'
 import { adminApi } from '@/api'
-import type { ExportPreflight, ExportRun } from '@/types'
+import { useAdaptivePageSize } from '@/composables/useAdaptivePageSize'
+import type { ExportFolder, ExportPreflight, ExportRun } from '@/types'
 
 const { t } = useI18n()
+const { pageSize } = useAdaptivePageSize({
+  rowHeight: 52,
+  headerHeight: 430,
+  footerHeight: 76,
+  safePadding: 48,
+  minRows: 6,
+})
 const loading = ref(false)
 const running = ref(false)
+const folderLoading = ref(false)
+const exportingFolderId = ref<number>()
+const exportStatus = ref<'all' | 'exported' | 'unexported'>('all')
+const page = ref(1)
+const folders = ref<ExportFolder[]>([])
+const total = ref(0)
 const preflight = ref<ExportPreflight>()
 const current = ref<ExportRun>()
-const runs = ref<ExportRun[]>([])
 let pollTimer: number | undefined
 
-const isActive = computed(() => ['QUEUED', 'RUNNING'].includes(current.value?.status || ''))
+function runIsActive(run?: ExportRun) {
+  return ['QUEUED', 'RUNNING'].includes(run?.status || '')
+}
+
+const isActive = computed(() => runIsActive(current.value))
 const canRun = computed(() =>
   Boolean(preflight.value?.ready && preflight.value.eligibleCount > 0 && !isActive.value),
 )
-const canRetry = computed(() =>
-  Boolean(!isActive.value && current.value?.items.some((item) => item.status === 'FAILED')),
+const completedCount = computed(() =>
+  (current.value?.succeeded || 0) + (current.value?.failed || 0) + (current.value?.skipped || 0),
 )
 const progress = computed(() => {
   if (!current.value?.total) return 0
-  return Math.round(((current.value.succeeded + current.value.failed) * 100) / current.value.total)
+  return Math.round((completedCount.value * 100) / current.value.total)
 })
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value)))
+const pageStart = computed(() => (total.value ? (page.value - 1) * pageSize.value + 1 : 0))
+const pageEnd = computed(() => Math.min(total.value, page.value * pageSize.value))
+
+function normalizePage() {
+  page.value = Math.min(page.value, totalPages.value)
+}
+
+async function fetchFolderPage(resetPage = false) {
+  if (resetPage) page.value = 1
+  let response = await adminApi.exportFolders(exportStatus.value, page.value, pageSize.value)
+  total.value = response.data.data.total
+  normalizePage()
+  if (response.data.data.page !== page.value) {
+    response = await adminApi.exportFolders(exportStatus.value, page.value, pageSize.value)
+    total.value = response.data.data.total
+  }
+  folders.value = response.data.data.records
+}
 
 async function loadAll() {
   loading.value = true
   try {
-    const [preflightResult, runsResult] = await Promise.all([
+    const [preflightResult] = await Promise.all([
       adminApi.exportPreflight(),
-      adminApi.exportRuns(),
+      fetchFolderPage(),
     ])
     preflight.value = preflightResult.data.data
     current.value = preflight.value.activeRun
-    runs.value = runsResult.data.data
+    if (isActive.value) schedulePoll()
   } catch (error) {
     ElMessage.error((error as Error).message)
   } finally {
@@ -43,21 +79,114 @@ async function loadAll() {
   }
 }
 
+async function loadFolders(resetPage = false) {
+  folderLoading.value = true
+  try {
+    await fetchFolderPage(resetPage)
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+  } finally {
+    folderLoading.value = false
+  }
+}
+
+function stopPolling() {
+  if (pollTimer !== undefined) {
+    window.clearTimeout(pollTimer)
+    pollTimer = undefined
+  }
+}
+
+function schedulePoll() {
+  if (pollTimer !== undefined || !isActive.value) return
+  pollTimer = window.setTimeout(() => {
+    pollTimer = undefined
+    void poll()
+  }, 3000)
+}
+
+function showFailureNotice(run?: ExportRun) {
+  const failedItems = run?.items.filter((item) => item.status === 'FAILED') || []
+  if (!failedItems.length) return
+  const visibleItems = failedItems.slice(0, 3)
+  const details = visibleItems
+    .map((item) => t('admin.exports.failedItem', {
+      id: item.folderId,
+      error: item.error || t('admin.exports.unknownError'),
+    }))
+    .join('；')
+  const remaining = failedItems.length - visibleItems.length
+  const more = remaining > 0 ? t('admin.exports.failedMore', { count: remaining }) : ''
+  ElMessage({
+    type: 'error',
+    message: t('admin.exports.failedNotice', {
+      count: failedItems.length,
+      details,
+      more,
+    }),
+    duration: 10000,
+    showClose: true,
+  })
+}
+
 async function poll() {
   try {
     const { data } = await adminApi.currentExport()
-    current.value = data.data || undefined
-    if (!isActive.value) {
-      const [preflightResult, runsResult] = await Promise.all([
-        adminApi.exportPreflight(),
-        adminApi.exportRuns(),
-      ])
-      preflight.value = preflightResult.data.data
-      runs.value = runsResult.data.data
+    const finishedRun = data.data || undefined
+    current.value = finishedRun
+    if (runIsActive(finishedRun)) {
+      schedulePoll()
+      return
     }
+    stopPolling()
+    await loadAll()
+    showFailureNotice(finishedRun)
   } catch {
-    // The next poll or manual refresh will retry.
+    schedulePoll()
   }
+}
+
+async function exportFolder(folder: ExportFolder) {
+  if (!folder.exportable || folder.isExported || isActive.value) return
+  try {
+    await ElMessageBox.confirm(
+      t('admin.exports.singleConfirm', { name: folder.folderName }),
+      t('admin.exports.export'),
+      { type: 'warning' },
+    )
+  } catch {
+    return
+  }
+  exportingFolderId.value = folder.folderId
+  try {
+    const { data } = await adminApi.runFolderExport(folder.folderId)
+    current.value = data.data
+    ElMessage.success(t('admin.exports.started'))
+    schedulePoll()
+  } catch (error) {
+    ElMessage.error((error as Error).message)
+    await loadAll()
+  } finally {
+    exportingFolderId.value = undefined
+  }
+}
+
+function exportActionLabel(folder: ExportFolder) {
+  if (folder.isExported) return t('admin.exports.exported')
+  if (!folder.exportable) return t('admin.exports.waitingQc')
+  return t('admin.exports.export')
+}
+
+function formatDate(value?: string) {
+  if (!value) return '—'
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
+}
+
+function changePage(nextPage: number) {
+  if (nextPage < 1 || nextPage > totalPages.value || nextPage === page.value) return
+  page.value = nextPage
+  void loadFolders()
 }
 
 async function startExport() {
@@ -75,6 +204,7 @@ async function startExport() {
     const { data } = await adminApi.runExport()
     current.value = data.data
     ElMessage.success(t('admin.exports.started'))
+    schedulePoll()
   } catch (error) {
     ElMessage.error((error as Error).message)
     await loadAll()
@@ -83,32 +213,17 @@ async function startExport() {
   }
 }
 
-async function retryFailed() {
-  running.value = true
-  try {
-    const { data } = await adminApi.retryExport()
-    current.value = data.data
-    ElMessage.success(t('admin.exports.started'))
-  } catch (error) {
-    ElMessage.error((error as Error).message)
-  } finally {
-    running.value = false
-  }
-}
-
-function formatDate(value?: string) {
-  if (!value) return '—'
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
-}
-
 onMounted(() => {
   void loadAll()
-  pollTimer = window.setInterval(() => void poll(), 3000)
 })
 
 onBeforeUnmount(() => {
-  if (pollTimer !== undefined) window.clearInterval(pollTimer)
+  stopPolling()
+})
+
+watch(pageSize, () => {
+  page.value = 1
+  void loadFolders()
 })
 </script>
 
@@ -135,14 +250,8 @@ onBeforeUnmount(() => {
       <div class="metric accent">
         <span>{{ t('admin.exports.eligible') }}</span><strong>{{ preflight?.eligibleCount || 0 }}</strong>
       </div>
-      <div class="metric">
-        <span>{{ t('admin.exports.status') }}</span><strong class="status-text">{{ current?.status || 'IDLE' }}</strong>
-      </div>
       <div class="metric green">
-        <span>{{ t('admin.exports.succeeded') }}</span><strong>{{ current?.succeeded || 0 }}</strong>
-      </div>
-      <div class="metric">
-        <span>{{ t('admin.exports.failed') }}</span><strong>{{ current?.failed || 0 }}</strong>
+        <span>{{ t('admin.exports.exportedFolders') }}</span><strong>{{ preflight?.exportedCount || 0 }}</strong>
       </div>
     </div>
 
@@ -155,40 +264,73 @@ onBeforeUnmount(() => {
         </p>
       </div>
       <div class="actions">
-        <el-button :disabled="!canRetry" :loading="running" @click="retryFailed">
-          {{ t('admin.exports.retry') }}
-        </el-button>
         <el-button type="primary" :disabled="!canRun" :loading="running" @click="startExport">
           {{ t('admin.exports.run') }}
         </el-button>
       </div>
-      <el-progress v-if="current" :percentage="progress" :status="current.failed ? 'exception' : undefined" />
-    </section>
-
-    <section v-if="current?.items?.length" class="panel table-panel">
-      <div class="panel-heading"><h2>{{ t('admin.exports.currentItems') }}</h2></div>
-      <el-table :data="current.items" max-height="360">
-        <el-table-column prop="folderId" label="Folder ID" width="110" />
-        <el-table-column prop="status" :label="t('admin.exports.status')" width="130" />
-        <el-table-column prop="groupId" label="Group ID" min-width="220" />
-        <el-table-column prop="zipPath" label="ZIP" min-width="260" show-overflow-tooltip />
-        <el-table-column prop="error" :label="t('admin.exports.error')" min-width="260" show-overflow-tooltip />
-      </el-table>
+      <div v-if="isActive && current" class="running-progress">
+        <span>{{ t('admin.exports.exportingProgress', { completed: completedCount, total: current.total }) }}</span>
+        <el-progress :percentage="progress" />
+      </div>
     </section>
 
     <section class="panel table-panel">
-      <div class="panel-heading"><h2>{{ t('admin.exports.history') }}</h2></div>
-      <el-table :data="runs" max-height="320">
-        <el-table-column prop="runId" label="Run ID" min-width="240" show-overflow-tooltip />
-        <el-table-column prop="status" :label="t('admin.exports.status')" width="150" />
-        <el-table-column prop="createdBy" :label="t('admin.exports.createdBy')" width="140" />
-        <el-table-column :label="t('admin.exports.createdAt')" min-width="180">
-          <template #default="{ row }">{{ formatDate(row.createdAt) }}</template>
+      <div class="panel-heading folder-list-heading">
+        <h2>{{ t('admin.exports.allFolders') }}</h2>
+        <el-select v-model="exportStatus" class="export-filter" @change="loadFolders(true)">
+          <el-option :label="t('admin.exports.filterAll')" value="all" />
+          <el-option :label="t('admin.exports.filterExported')" value="exported" />
+          <el-option :label="t('admin.exports.filterUnexported')" value="unexported" />
+        </el-select>
+      </div>
+      <el-table v-if="folders.length" v-loading="folderLoading" :data="folders" max-height="560">
+        <el-table-column prop="folderId" label="Folder ID" width="110" />
+        <el-table-column prop="folderName" :label="t('admin.exports.folder')" min-width="180" show-overflow-tooltip />
+        <el-table-column prop="folderSeq" :label="t('admin.exports.sequence')" width="100" />
+        <el-table-column prop="boxName" :label="t('admin.exports.box')" min-width="160" show-overflow-tooltip />
+        <el-table-column :label="t('admin.exports.project')" min-width="240" show-overflow-tooltip>
+          <template #default="{ row }">{{ row.projectId }} · {{ row.projectName }}</template>
         </el-table-column>
-        <el-table-column prop="total" :label="t('admin.exports.total')" width="90" />
-        <el-table-column prop="succeeded" :label="t('admin.exports.succeeded')" width="90" />
-        <el-table-column prop="failed" :label="t('admin.exports.failed')" width="90" />
+        <el-table-column prop="imageCount" :label="t('admin.exports.images')" width="110" />
+        <el-table-column prop="qcStatus" label="QC" width="105" />
+        <el-table-column :label="t('admin.exports.exportStatus')" width="120">
+          <template #default="{ row }">
+            <el-tag :type="row.isExported ? 'success' : 'info'">
+              {{ row.isExported ? t('admin.exports.exported') : t('admin.exports.unexported') }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="groupId" label="Group ID" min-width="220" show-overflow-tooltip />
+        <el-table-column :label="t('admin.exports.exportedAt')" min-width="180">
+          <template #default="{ row }">{{ formatDate(row.exportedTime) }}</template>
+        </el-table-column>
+        <el-table-column :label="t('common.actions')" width="130" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              type="primary"
+              size="small"
+              :disabled="!row.exportable || row.isExported || isActive"
+              :loading="exportingFolderId === row.folderId"
+              @click="exportFolder(row)"
+            >
+              {{ exportActionLabel(row) }}
+            </el-button>
+          </template>
+        </el-table-column>
       </el-table>
+      <el-empty v-else :description="t('admin.exports.noFolders')" />
+      <footer class="bottom-pager">
+        <el-button :disabled="page <= 1" :icon="'ArrowLeft'" @click="changePage(page - 1)">
+          {{ t('common.previousPage') }}
+        </el-button>
+        <span class="pager-status">
+          {{ t('common.pageStatus', { page, pages: totalPages, total }) }}
+          <small>{{ t('common.rangeStatus', { start: pageStart, end: pageEnd }) }}</small>
+        </span>
+        <el-button :disabled="page >= totalPages" @click="changePage(page + 1)">
+          {{ t('common.nextPage') }}<el-icon class="el-icon--right"><ArrowRight /></el-icon>
+        </el-button>
+      </footer>
     </section>
   </AppShell>
 </template>
@@ -205,12 +347,19 @@ onBeforeUnmount(() => {
 .page-title h1 { margin: 0 0 6px; font-size: 28px; }
 .page-title p, .action-panel p { margin: 0; color: var(--el-text-color-secondary); }
 .export-metrics { margin: 20px 0; }
-.status-text { font-size: 20px !important; }
 .action-panel { padding: 22px 24px; margin-bottom: 20px; flex-wrap: wrap; }
 .action-panel h2 { margin: 0 0 8px; }
-.action-panel .el-progress { flex-basis: 100%; }
+.running-progress { flex-basis: 100%; color: var(--el-text-color-secondary); }
+.running-progress .el-progress { margin-top: 8px; }
 .actions { display: flex; gap: 10px; }
 .table-panel { margin-bottom: 20px; overflow: hidden; }
 .panel-heading { padding: 18px 22px; border-bottom: 1px solid var(--el-border-color-lighter); }
 .panel-heading h2 { margin: 0; font-size: 18px; }
+.folder-list-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.export-filter { width: 170px; }
+.bottom-pager {
+  margin-top: 0;
+  padding: 16px 22px;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
 </style>

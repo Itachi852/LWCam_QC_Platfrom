@@ -19,6 +19,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, joinedload, lazyload, selectinload
 
 from app.core.config import settings
+from app.core.paths import to_local
 from app.db.session import SessionLocal, engine
 from app.models.capture import CaptureBox, CaptureFolder, CaptureImage
 from app.models.project import Project
@@ -279,7 +280,7 @@ def load_folder_snapshot(db: Session, folder_id: int) -> FolderExportSnapshot:
     project = folder.box.project
     if project is None or project.is_deleted:
         raise ExportError("Folder 所属项目不存在或已删除")
-    image_dir = Path(folder.folder_path).expanduser().resolve()
+    image_dir = to_local(folder.folder_path).resolve()
     if not image_dir.is_dir():
         raise ExportError(f"Folder 原图目录不存在: {image_dir}")
     image_sources: list[ImageSource] = []
@@ -574,6 +575,89 @@ def eligible_folder_ids(db: Session) -> list[int]:
     )
 
 
+def list_export_folders(
+    db: Session,
+    export_status: str = "all",
+    *,
+    page: int = 1,
+    size: int = 20,
+) -> tuple[list[dict[str, Any]], int]:
+    conditions = [
+        CaptureFolder.is_deleted.is_not(True),
+        func.lower(CaptureFolder.qc_status) != "rework",
+    ]
+    if export_status == "exported":
+        conditions.append(CaptureFolder.is_exported.is_(True))
+    elif export_status == "unexported":
+        conditions.append(CaptureFolder.is_exported.is_not(True))
+
+    folder_scope = (
+        select(CaptureFolder.id)
+        .join(CaptureBox, CaptureFolder.box_id == CaptureBox.box_id)
+        .join(Project, CaptureBox.project_id == Project.id)
+        .where(*conditions)
+    )
+    total = int(
+        db.scalar(
+            select(func.count()).select_from(folder_scope.order_by(None).subquery())
+        )
+        or 0
+    )
+    rows = db.execute(
+        select(
+            CaptureFolder.id.label("folder_id"),
+            CaptureFolder.folder_name,
+            CaptureFolder.folder_seq,
+            CaptureFolder.qc_status,
+            CaptureFolder.is_exported,
+            CaptureFolder.exported_time,
+            CaptureFolder.group_id,
+            CaptureBox.box_name,
+            Project.project_id,
+            Project.project_name,
+            func.count(CaptureImage.id).label("image_count"),
+        )
+        .join(CaptureBox, CaptureFolder.box_id == CaptureBox.box_id)
+        .join(Project, CaptureBox.project_id == Project.id)
+        .outerjoin(CaptureImage, CaptureImage.folder_id == CaptureFolder.id)
+        .where(*conditions)
+        .group_by(
+            CaptureFolder.id,
+            CaptureFolder.folder_name,
+            CaptureFolder.folder_seq,
+            CaptureFolder.qc_status,
+            CaptureFolder.is_exported,
+            CaptureFolder.exported_time,
+            CaptureFolder.group_id,
+            CaptureBox.box_name,
+            Project.project_id,
+            Project.project_name,
+            CaptureFolder.source_created_at,
+        )
+        .order_by(CaptureFolder.source_created_at.asc().nullslast(), CaptureFolder.id.asc())
+        .offset((page - 1) * size)
+        .limit(size)
+    ).all()
+    records = [
+        {
+            "folderId": row.folder_id,
+            "folderName": row.folder_name,
+            "folderSeq": row.folder_seq,
+            "qcStatus": row.qc_status,
+            "isExported": bool(row.is_exported),
+            "exportedTime": row.exported_time,
+            "groupId": row.group_id,
+            "exportable": row.qc_status.lower() == "pass" and not bool(row.is_exported),
+            "boxName": row.box_name,
+            "projectId": row.project_id,
+            "projectName": row.project_name,
+            "imageCount": row.image_count,
+        }
+        for row in rows
+    ]
+    return records, total
+
+
 class ExportCoordinator:
     def __init__(self) -> None:
         self._state_lock = threading.RLock()
@@ -584,7 +668,12 @@ class ExportCoordinator:
     def _state_root(self, config: ExportRuntimeConfig) -> Path:
         root = config.temp_dir / ".lwcam-export"
         root.mkdir(parents=True, exist_ok=True)
-        (root / "runs").mkdir(parents=True, exist_ok=True)
+        legacy_runs = root / "runs"
+        if legacy_runs.is_dir():
+            try:
+                shutil.rmtree(legacy_runs)
+            except OSError:
+                pass
         return root
 
     @staticmethod
@@ -607,7 +696,6 @@ class ExportCoordinator:
             payload = json.loads(json.dumps(self._state, ensure_ascii=False, default=str))
         root = self._state_root(config)
         self._atomic_json(root / "active.json", payload)
-        self._atomic_json(root / "runs" / f"{payload['runId']}.json", payload)
 
     def _cleanup_workspaces(self, config: ExportRuntimeConfig) -> None:
         work_root = self._state_root(config) / "work"
@@ -638,22 +726,6 @@ class ExportCoordinator:
         except (OSError, json.JSONDecodeError):
             return None
 
-    def history(self) -> list[dict[str, Any]]:
-        try:
-            config = runtime_config()
-        except ExportError:
-            return []
-        runs_dir = config.temp_dir / ".lwcam-export" / "runs"
-        if not runs_dir.is_dir():
-            return []
-        records = []
-        for path in runs_dir.glob("*.json"):
-            try:
-                records.append(json.loads(path.read_text(encoding="utf-8")))
-            except (OSError, json.JSONDecodeError):
-                continue
-        return sorted(records, key=lambda item: item.get("createdAt", ""), reverse=True)
-
     def preflight(self, db: Session) -> dict[str, Any]:
         errors: list[str] = []
         config: ExportRuntimeConfig | None = None
@@ -662,13 +734,33 @@ class ExportCoordinator:
             validate_runtime_paths(config)
         except ExportError as error:
             errors.append(str(error))
-        folder_ids = eligible_folder_ids(db)
+        eligible_conditions = [
+            func.lower(CaptureFolder.qc_status) == "pass",
+            CaptureFolder.is_exported.is_not(True),
+            CaptureFolder.is_deleted.is_not(True),
+        ]
+        eligible_count = int(
+            db.scalar(
+                select(func.count(CaptureFolder.id)).where(*eligible_conditions)
+            )
+            or 0
+        )
+        exported_count = int(
+            db.scalar(
+                select(func.count(CaptureFolder.id)).where(
+                    CaptureFolder.is_exported.is_(True),
+                    CaptureFolder.is_deleted.is_not(True),
+                    func.lower(CaptureFolder.qc_status) != "rework",
+                )
+            )
+            or 0
+        )
         invalid_projects: list[dict[str, Any]] = []
-        if folder_ids:
+        if eligible_count:
             project_ids = db.scalars(
                 select(CaptureBox.project_id)
                 .join(CaptureFolder, CaptureFolder.box_id == CaptureBox.box_id)
-                .where(CaptureFolder.id.in_(folder_ids))
+                .where(*eligible_conditions)
                 .distinct()
             ).all()
             projects = db.scalars(
@@ -693,7 +785,8 @@ class ExportCoordinator:
         return {
             "ready": not errors,
             "errors": errors,
-            "eligibleCount": len(folder_ids),
+            "eligibleCount": eligible_count,
+            "exportedCount": exported_count,
             "invalidProjects": invalid_projects,
             "config": config.to_json() if config else None,
             "activeRun": self.current(),
@@ -703,7 +796,6 @@ class ExportCoordinator:
         self,
         admin_user_id: str,
         folder_ids: list[int] | None = None,
-        retry_items: dict[int, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         config = runtime_config()
         validate_runtime_paths(config)
@@ -726,15 +818,16 @@ class ExportCoordinator:
                 "total": len(selected),
                 "succeeded": 0,
                 "failed": 0,
+                "skipped": 0,
                 "currentFolderId": None,
                 "items": [
                     {
                         "folderId": folder_id,
                         "status": "PENDING",
-                        "groupId": (retry_items or {}).get(folder_id, {}).get("groupId"),
-                        "zipPath": (retry_items or {}).get(folder_id, {}).get("zipPath"),
-                        "zipSize": (retry_items or {}).get(folder_id, {}).get("zipSize"),
-                        "zipSha256": (retry_items or {}).get(folder_id, {}).get("zipSha256"),
+                        "groupId": None,
+                        "zipPath": None,
+                        "zipSize": None,
+                        "zipSha256": None,
                         "error": None,
                     }
                     for folder_id in selected
@@ -751,20 +844,6 @@ class ExportCoordinator:
             )
             self._thread.start()
             return self.current() or state
-
-    def retry_failed(self, admin_user_id: str) -> dict[str, Any]:
-        current = self.current()
-        if not current:
-            raise ExportError("没有可重试的导出记录")
-        failed_items = {
-            int(item["folderId"]): item
-            for item in current.get("items", [])
-            if item.get("status") == "FAILED"
-        }
-        failed_ids = list(failed_items)
-        if not failed_ids:
-            raise ExportError("没有失败的 Folder")
-        return self.start(admin_user_id, failed_ids, failed_items)
 
     def resume_if_needed(self) -> None:
         try:
@@ -809,66 +888,45 @@ class ExportCoordinator:
                     candidate.get("status") == "FAILED"
                     for candidate in self._state["items"]
                 )
+                self._state["skipped"] = sum(
+                    candidate.get("status") == "SKIPPED_BUSY"
+                    for candidate in self._state["items"]
+                )
         self._persist(config)
 
     def _run(self, config: ExportRuntimeConfig) -> None:
-        with engine.connect() as batch_lock:
-            acquired = bool(
-                batch_lock.scalar(
-                    text(
-                        "SELECT pg_try_advisory_lock("
-                        "hashtextextended('lwcam-export-batch', 0))"
-                    ),
-                )
-            )
-            if not acquired:
-                with self._state_lock:
-                    if self._state:
-                        self._state["status"] = "FAILED"
-                        self._state["completedAt"] = utc_now().isoformat()
-                        self._state["error"] = "另一个后端进程正在执行导出"
-                self._persist(config)
+        with self._state_lock:
+            if not self._state:
                 return
+            self._state["status"] = "RUNNING"
+            self._state["startedAt"] = self._state.get("startedAt") or utc_now().isoformat()
+            items = self._state["items"]
+            run_id = self._state["runId"]
+        self._persist(config)
+        for item in items:
+            if item.get("status") in {"SUCCEEDED", "SKIPPED_BUSY"}:
+                continue
+            folder_id = int(item["folderId"])
+            with self._state_lock:
+                if self._state:
+                    self._state["currentFolderId"] = folder_id
+            self._set_item(config, item, status="RUNNING", error=None)
             try:
-                with self._state_lock:
-                    if not self._state:
-                        return
-                    self._state["status"] = "RUNNING"
-                    self._state["startedAt"] = self._state.get("startedAt") or utc_now().isoformat()
-                    items = self._state["items"]
-                    run_id = self._state["runId"]
-                self._persist(config)
-                for item in items:
-                    if item.get("status") == "SUCCEEDED":
-                        continue
-                    folder_id = int(item["folderId"])
-                    with self._state_lock:
-                        if self._state:
-                            self._state["currentFolderId"] = folder_id
-                    self._set_item(config, item, status="RUNNING", error=None)
-                    try:
-                        self._export_one(folder_id, run_id, config, item)
-                    except Exception as error:
-                        self._set_item(config, item, status="FAILED", error=str(error))
-                with self._state_lock:
-                    if self._state:
-                        succeeded = int(self._state["succeeded"])
-                        failed = int(self._state["failed"])
-                        self._state["status"] = (
-                            "SUCCEEDED"
-                            if failed == 0
-                            else ("FAILED" if succeeded == 0 else "PARTIAL_FAILED")
-                        )
-                        self._state["currentFolderId"] = None
-                        self._state["completedAt"] = utc_now().isoformat()
-                self._persist(config)
-            finally:
-                batch_lock.execute(
-                    text(
-                        "SELECT pg_advisory_unlock("
-                        "hashtextextended('lwcam-export-batch', 0))"
-                    ),
+                self._export_one(folder_id, run_id, config, item)
+            except Exception as error:
+                self._set_item(config, item, status="FAILED", error=str(error))
+        with self._state_lock:
+            if self._state:
+                succeeded = int(self._state["succeeded"])
+                failed = int(self._state["failed"])
+                self._state["status"] = (
+                    "SUCCEEDED"
+                    if failed == 0
+                    else ("FAILED" if succeeded == 0 else "PARTIAL_FAILED")
                 )
+                self._state["currentFolderId"] = None
+                self._state["completedAt"] = utc_now().isoformat()
+        self._persist(config)
 
     def _export_one(
         self,
@@ -888,7 +946,13 @@ class ExportCoordinator:
                 )
             )
             if not acquired:
-                raise ExportError("Folder 正由其他导出进程处理")
+                self._set_item(
+                    config,
+                    item,
+                    status="SKIPPED_BUSY",
+                    error="Folder 正由另一工作站导出",
+                )
+                return
             try:
                 with SessionLocal() as db:
                     folder = db.get(CaptureFolder, folder_id)

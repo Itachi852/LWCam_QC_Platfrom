@@ -10,7 +10,7 @@ from app.core.security import hash_password
 from app.dependencies import AdminUser, DbSession
 from app.models.capture import CaptureBox, CaptureFolder, CaptureImage
 from app.models.project import Project, Role, UserProject
-from app.models.user import ROLE_ADMIN, ROLE_QC, User
+from app.models.user import ROLE_ADMIN, ROLE_QC, User, normalize_role
 from app.schemas.admin import (
     AdminQcTaskVO,
     CreateUserRequest,
@@ -24,6 +24,9 @@ from app.services.serializers import to_user_admin_vo
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 ALLOWED_ROLES = {"admin": ROLE_ADMIN, "qc": ROLE_QC}
+# Normalized roles this platform grants and revokes. Anything else in
+# `users.roles` belongs to another app in the suite — see merge_roles.
+MANAGED_ROLES = {normalize_role(ROLE_ADMIN), normalize_role(ROLE_QC)}
 ALLOWED_STATUSES = {"active", "disabled"}
 FOLDER_STATUS_LABELS = {
     "pending": "pending",
@@ -63,12 +66,28 @@ def active_projects(db, project_ids: list[int]) -> list[Project]:
     return list(projects)
 
 
+def merge_roles(existing: str | None, role: str) -> str:
+    """Swap in `role`, keeping every token this platform does not own.
+
+    `users.roles` is shared with LWCAM/LWCamAdmin, where an account is commonly
+    'admin,capture'. Assigning the column outright would silently strip 'capture'
+    (and any role a future module adds), locking that operator out of capture —
+    so only the roles in MANAGED_ROLES are replaced.
+    """
+    kept = [
+        token
+        for token in (segment.strip() for segment in (existing or "").split(","))
+        if token and normalize_role(token) not in MANAGED_ROLES
+    ]
+    return ",".join([role, *kept])
+
+
 def apply_role_projects(user: User, role: str, status: str, projects: list[Project]) -> None:
     if status not in ALLOWED_STATUSES:
         raise BusinessError(ApiCodes.BAD_REQUEST, "不支持的用户状态")
     if role == ROLE_QC and status == "active" and not projects:
         raise BusinessError(ApiCodes.BAD_REQUEST, "启用的QC账号至少需要分配一个项目")
-    user.roles = role
+    user.roles = merge_roles(user.roles, role)
     user.active = status == "active"
 
 
@@ -351,6 +370,10 @@ def stats_overview(_: AdminUser, db: DbSession) -> ApiResponse[StatsOverviewVO]:
             CaptureFolder.is_deleted.is_not(True),
             func.lower(CaptureFolder.qc_status) == "pending",
             CaptureFolder.qc_locked_by.is_(None),
+            # Same gate as qc.visible_folder_conditions — a folder LWIP hasn't
+            # finished has no image directory and cannot be claimed, so counting
+            # it here would report more claimable work than the QC queue offers.
+            CaptureFolder.folder_path.is_not(None),
         )
     ) or 0
     reviewing = db.scalar(

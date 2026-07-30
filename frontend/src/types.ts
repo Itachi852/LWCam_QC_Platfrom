@@ -14,7 +14,10 @@ export interface PageResult<T> {
 export interface UserInfo {
   id: number
   userId: string
+  /** Highest-precedence role — display and default landing page only. */
   role: string
+  /** Every role held. Route guards must use this for multi-role accounts. */
+  roles?: string[]
   status: string
   homePath: string
   mustChangePassword: boolean
@@ -68,14 +71,35 @@ export interface ExportRun {
   total: number
   succeeded: number
   failed: number
+  /** Missing from run records persisted before multi-station support. */
+  skipped?: number
   currentFolderId?: number
   items: ExportRunItem[]
+}
+
+export interface ExportableFolder {
+  folderId: number
+  folderName: string
+  folderSeq: number
+  boxName: string
+  projectId: string
+  projectName: string
+  imageCount: number
+}
+
+export interface ExportFolder extends ExportableFolder {
+  qcStatus: string
+  isExported: boolean
+  exportedTime?: string
+  groupId?: string
+  exportable: boolean
 }
 
 export interface ExportPreflight {
   ready: boolean
   errors: string[]
   eligibleCount: number
+  exportedCount: number
   invalidProjects: Array<{ id: number; projectId: string; projectName: string }>
   config?: ExportConfig
   activeRun?: ExportRun

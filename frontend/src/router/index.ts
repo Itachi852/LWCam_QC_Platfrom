@@ -78,8 +78,12 @@ router.beforeEach((to) => {
       return { path: '/change-password' }
     }
     const roles = to.meta.roles as string[] | undefined
-    if (roles && auth.user && !roles.includes(auth.user.role)) {
-      return auth.user.homePath || '/login'
+    if (roles && auth.user) {
+      // A user can hold both QC and admin; role is only the display/default role.
+      const held = auth.user.roles?.length ? auth.user.roles : [auth.user.role]
+      if (!roles.some((role) => held.includes(role))) {
+        return auth.user.homePath || '/login'
+      }
     }
   }
   return true

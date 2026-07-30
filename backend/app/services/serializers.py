@@ -16,6 +16,7 @@ def to_user_vo(user: User) -> UserVO:
         id=user.id,
         userId=user.user_id,
         role=user.role,
+        roles=sorted(user.role_set),
         status=user.status,
         homePath=user_home_path(user.role),
         mustChangePassword=user.must_change_password,
