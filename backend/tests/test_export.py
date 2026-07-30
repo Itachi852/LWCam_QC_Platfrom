@@ -26,6 +26,18 @@ from app.services.export import (
 
 
 class ExportContractTests(unittest.TestCase):
+    def test_export_error_exposes_stable_localization_payload(self) -> None:
+        error = ExportError("imageMissing", {"filename": "page_001.tif"})
+
+        self.assertEqual(
+            error.to_dict(),
+            {
+                "errorKey": "imageMissing",
+                "errorParams": {"filename": "page_001.tif"},
+            },
+        )
+        self.assertIn("page_001.tif", str(error))
+
     @staticmethod
     def _config(root: Path) -> ExportRuntimeConfig:
         return ExportRuntimeConfig(
@@ -246,6 +258,8 @@ class ExportContractTests(unittest.TestCase):
                 coordinator._export_one(1, "test-run", config, item)
 
             self.assertEqual(item["status"], "SKIPPED_BUSY")
+            self.assertEqual(item["errorKey"], "folderBusy")
+            self.assertEqual(item["errorParams"], {})
             self.assertEqual(coordinator._state["failed"], 0)
             self.assertEqual(coordinator._state["skipped"], 1)
 

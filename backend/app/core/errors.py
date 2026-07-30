@@ -1,3 +1,5 @@
+from typing import Any
+
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -16,23 +18,30 @@ class ApiCodes:
 
 
 class BusinessError(Exception):
-    def __init__(self, code: int, message: str, http_status: int = status.HTTP_400_BAD_REQUEST):
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        http_status: int = status.HTTP_400_BAD_REQUEST,
+        data: Any = None,
+    ):
         self.code = code
         self.message = message
         self.http_status = http_status
+        self.data = data
 
 
-def error_response(code: int, message: str, http_status: int) -> JSONResponse:
+def error_response(code: int, message: str, http_status: int, data: Any = None) -> JSONResponse:
     return JSONResponse(
         status_code=http_status,
-        content={"code": code, "message": message, "data": None},
+        content={"code": code, "message": message, "data": data},
     )
 
 
 def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(BusinessError)
     async def handle_business_error(_: Request, exc: BusinessError) -> JSONResponse:
-        return error_response(exc.code, exc.message, exc.http_status)
+        return error_response(exc.code, exc.message, exc.http_status, exc.data)
 
     @app.exception_handler(RequestValidationError)
     async def handle_request_validation(_: Request, exc: RequestValidationError) -> JSONResponse:

@@ -59,6 +59,8 @@ export interface ExportRunItem {
   groupId?: string
   zipPath?: string
   error?: string
+  errorKey?: string
+  errorParams?: Record<string, unknown>
 }
 
 export interface ExportRun {
@@ -97,12 +99,17 @@ export interface ExportFolder extends ExportableFolder {
 
 export interface ExportPreflight {
   ready: boolean
-  errors: string[]
+  errors: ExportIssue[]
   eligibleCount: number
   exportedCount: number
   invalidProjects: Array<{ id: number; projectId: string; projectName: string }>
   config?: ExportConfig
   activeRun?: ExportRun
+}
+
+export interface ExportIssue {
+  errorKey: string
+  errorParams?: Record<string, unknown>
 }
 
 export interface AdminQcTask {

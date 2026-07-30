@@ -9,6 +9,20 @@ const request = axios.create({
   timeout: 15000,
 })
 
+function localizedApiMessage(payload?: ApiResponse<unknown>) {
+  const detail = payload?.data as
+    | { errorKey?: string; errorParams?: Record<string, unknown> }
+    | null
+    | undefined
+  if (detail?.errorKey) {
+    const key = `admin.exports.errors.${detail.errorKey}`
+    if (i18n.global.te(key)) {
+      return i18n.global.t(key, detail.errorParams || {})
+    }
+  }
+  return payload?.message
+}
+
 request.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   const auth = useAuthStore()
   if (auth.token) {
@@ -22,12 +36,15 @@ request.interceptors.response.use(
     if (response.config.responseType === 'blob') return response
     const payload = response.data as ApiResponse<unknown>
     if (payload.code !== 0) {
-      return Promise.reject(new Error(payload.message || i18n.global.t('errors.requestFailed')))
+      return Promise.reject(new Error(localizedApiMessage(payload) || i18n.global.t('errors.requestFailed')))
     }
     return response
   },
   (error: AxiosError<ApiResponse<unknown>>) => {
-    const message = error.response?.data?.message || error.message || i18n.global.t('errors.network')
+    const message =
+      localizedApiMessage(error.response?.data) ||
+      error.message ||
+      i18n.global.t('errors.network')
     if (error.response?.status === 401) {
       const auth = useAuthStore()
       auth.clear()

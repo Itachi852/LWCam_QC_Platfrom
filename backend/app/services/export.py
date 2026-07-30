@@ -63,8 +63,57 @@ SAFE_GROUP_PART = re.compile(r"^[A-Za-z0-9_-]+$")
 DEFLATE_COMPRESSION_TAGS = {8, 32946}
 
 
+EXPORT_ERROR_MESSAGES = {
+    "configInvalid": "导出配置无效: {fields}",
+    "pathNotWritable": "{setting} 不可写: {path}",
+    "projectIdMissing": "项目 {project} 未配置 projects.project_id",
+    "invalidGroupPart": "{label} 只能包含字母、数字、下划线和连字符",
+    "sourceFilenameInvalid": "首张图片文件名不符合 <UserID>_IMG_YYYYMMDD_HHMMSS_NNN.ext: {filename}",
+    "sourceDateInvalid": "首张图片日期无效: {filename}",
+    "projectIdInvalid": "项目 ID 无效",
+    "sequenceExhausted": "项目 {projectId} 的导出序列已耗尽",
+    "groupIdTooLong": "Group ID 超过 255 个字符",
+    "folderMissing": "Folder 不存在或已删除",
+    "folderNotPass": "Folder 尚未通过 QC",
+    "folderAlreadyExported": "Folder 已导出",
+    "sourceDirectoryNotConfigured": "Folder 原图目录未配置",
+    "projectMissing": "Folder 所属项目不存在或已删除",
+    "sourceDirectoryMissing": "Folder 原图目录不存在: {path}",
+    "imageFilenameInvalid": "图片文件名无效: {filename}",
+    "imagePathEscape": "图片路径越界: {filename}",
+    "imageMissing": "图片文件不存在: {filename}",
+    "folderNoImages": "Folder 没有图片",
+    "metadataMissing": "Folder 导出必填元数据缺失: {fields}",
+    "tiffCompressionInvalid": "TIFF 未使用 adobe_deflate: {filename}",
+    "sourceDeleted": "导出期间源图片被删除: {filename}",
+    "sourceChanged": "导出期间源图片发生变化: {filename}",
+    "zipStructureInvalid": "ZIP 内文件结构或顺序不符合契约",
+    "zipCrcInvalid": "ZIP CRC 校验失败",
+    "publishedZipInvalid": "已发布 ZIP 校验失败",
+    "publishedZipUnreadable": "已发布 ZIP 无法读取: {path}",
+    "zipConflict": "最终目录存在不同内容的同名 ZIP: {filename}",
+    "zipCopyValidationFailed": "ZIP 复制到最终目录后校验失败",
+    "folderMissingAtFinalize": "最终写回时 Folder 不存在或已删除",
+    "folderGroupConflict": "Folder 已由其他导出写入不同 Group ID",
+    "folderNotPassAtFinalize": "最终写回时 Folder 已不再是 PASS",
+    "invalidProjects": "存在 projects.project_id 无效的项目",
+    "taskAlreadyRunning": "已有导出任务正在运行",
+    "noEligibleFolders": "没有可导出的 PASS Folder",
+    "folderBusy": "Folder 正由另一工作站导出",
+    "serviceRestarted": "服务重启后重新处理",
+    "unexpected": "导出发生未知错误",
+}
+
+
 class ExportError(RuntimeError):
-    pass
+    def __init__(self, key: str, params: dict[str, Any] | None = None):
+        self.key = key
+        self.params = params or {}
+        template = EXPORT_ERROR_MESSAGES.get(key, EXPORT_ERROR_MESSAGES["unexpected"])
+        super().__init__(template.format(**self.params))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"errorKey": self.key, "errorParams": self.params}
 
 
 @dataclass(frozen=True)
@@ -117,21 +166,21 @@ def utc_now() -> datetime:
 
 
 def runtime_config() -> ExportRuntimeConfig:
-    errors: list[str] = []
+    invalid_fields: list[str] = []
     temp_value = settings.export_temp_dir.strip()
     output_value = settings.export_output_dir.strip()
     encoding_value = settings.export_csv_encoding.strip().lower()
     line_ending_value = settings.export_csv_line_ending.strip().upper()
     if not temp_value:
-        errors.append("EXPORT_TEMP_DIR 未配置")
+        invalid_fields.append("EXPORT_TEMP_DIR")
     if not output_value:
-        errors.append("EXPORT_OUTPUT_DIR 未配置")
+        invalid_fields.append("EXPORT_OUTPUT_DIR")
     if encoding_value not in {"utf-8", "utf-8-sig"}:
-        errors.append("EXPORT_CSV_ENCODING 必须是 utf-8 或 utf-8-sig")
+        invalid_fields.append("EXPORT_CSV_ENCODING")
     if line_ending_value not in {"LF", "CRLF"}:
-        errors.append("EXPORT_CSV_LINE_ENDING 必须是 LF 或 CRLF")
-    if errors:
-        raise ExportError("；".join(errors))
+        invalid_fields.append("EXPORT_CSV_LINE_ENDING")
+    if invalid_fields:
+        raise ExportError("configInvalid", {"fields": ", ".join(invalid_fields)})
     return ExportRuntimeConfig(
         temp_dir=Path(temp_value).expanduser(),
         output_dir=Path(output_value).expanduser(),
@@ -151,7 +200,10 @@ def validate_runtime_paths(config: ExportRuntimeConfig) -> None:
             directory.mkdir(parents=True, exist_ok=True)
             probe.write_bytes(b"ok")
         except OSError as error:
-            raise ExportError(f"{label} 不可写: {directory}") from error
+            raise ExportError(
+                "pathNotWritable",
+                {"setting": label, "path": str(directory)},
+            ) from error
         finally:
             try:
                 probe.unlink(missing_ok=True)
@@ -162,7 +214,7 @@ def validate_runtime_paths(config: ExportRuntimeConfig) -> None:
 def project_ingest_id(project: Project) -> str:
     value = str(project.project_id or "").strip()
     if not value:
-        raise ExportError(f"项目 {project.project_name} 未配置 projects.project_id")
+        raise ExportError("projectIdMissing", {"project": project.project_name})
     validate_group_part("ProjectID", value)
     return value
 
@@ -188,20 +240,18 @@ def mapped_record_type(project: Project, title: str) -> str:
 
 def validate_group_part(label: str, value: str) -> None:
     if not value or not SAFE_GROUP_PART.fullmatch(value):
-        raise ExportError(f"{label} 只能包含字母、数字、下划线和连字符")
+        raise ExportError("invalidGroupPart", {"label": label})
 
 
 def parse_source_identity(filename: str) -> tuple[str, date]:
     match = SOURCE_NAME_PATTERN.fullmatch(filename)
     if match is None:
-        raise ExportError(
-            f"首张图片文件名不符合 <UserID>_IMG_YYYYMMDD_HHMMSS_NNN.ext: {filename}"
-        )
+        raise ExportError("sourceFilenameInvalid", {"filename": filename})
     user_id = match.group("user")
     try:
         source_date = datetime.strptime(match.group("date"), "%Y%m%d").date()
     except ValueError as error:
-        raise ExportError(f"首张图片日期无效: {filename}") from error
+        raise ExportError("sourceDateInvalid", {"filename": filename}) from error
     return user_id, source_date
 
 
@@ -223,7 +273,7 @@ def format_date(value: Any) -> str:
 
 def allocate_sequence(db: Session, project_id: int) -> int:
     if project_id <= 0:
-        raise ExportError("项目 ID 无效")
+        raise ExportError("projectIdInvalid")
     sequence_name = f"lwcam_export_project_{project_id}_seq"
     db.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:resource, 0))"),
@@ -239,7 +289,7 @@ def allocate_sequence(db: Session, project_id: int) -> int:
         db.scalar(text(f"SELECT nextval('public.{sequence_name}'::regclass)")) or 0
     )
     if value < 1 or value > 999999:
-        raise ExportError(f"项目 {project_id} 的导出序列已耗尽")
+        raise ExportError("sequenceExhausted", {"projectId": project_id})
     return value
 
 
@@ -251,7 +301,7 @@ def build_group_id(snapshot: FolderExportSnapshot, sequence: int) -> str:
         f"{snapshot.source_date.strftime('%y%m%d')}{sequence:06d}"
     )
     if len(group_id) > 255:
-        raise ExportError("Group ID 超过 255 个字符")
+        raise ExportError("groupIdTooLong")
     return group_id
 
 
@@ -270,30 +320,30 @@ def load_folder_snapshot(db: Session, folder_id: int) -> FolderExportSnapshot:
         .where(CaptureFolder.id == folder_id)
     )
     if folder is None or folder.is_deleted:
-        raise ExportError("Folder 不存在或已删除")
+        raise ExportError("folderMissing")
     if folder.qc_status.lower() != "pass":
-        raise ExportError("Folder 尚未通过 QC")
+        raise ExportError("folderNotPass")
     if folder.is_exported:
-        raise ExportError("Folder 已导出")
+        raise ExportError("folderAlreadyExported")
     if not folder.folder_path:
-        raise ExportError("Folder 原图目录未配置")
+        raise ExportError("sourceDirectoryNotConfigured")
     project = folder.box.project
     if project is None or project.is_deleted:
-        raise ExportError("Folder 所属项目不存在或已删除")
+        raise ExportError("projectMissing")
     image_dir = to_local(folder.folder_path).resolve()
     if not image_dir.is_dir():
-        raise ExportError(f"Folder 原图目录不存在: {image_dir}")
+        raise ExportError("sourceDirectoryMissing", {"path": str(image_dir)})
     image_sources: list[ImageSource] = []
     for image in ordered_images(folder):
         if Path(image.image_name).name != image.image_name:
-            raise ExportError(f"图片文件名无效: {image.image_name}")
+            raise ExportError("imageFilenameInvalid", {"filename": image.image_name})
         source_path = (image_dir / image.image_name).resolve()
         try:
             source_path.relative_to(image_dir)
         except ValueError as error:
-            raise ExportError(f"图片路径越界: {image.image_name}") from error
+            raise ExportError("imagePathEscape", {"filename": image.image_name}) from error
         if not source_path.is_file():
-            raise ExportError(f"图片文件不存在: {image.image_name}")
+            raise ExportError("imageMissing", {"filename": image.image_name})
         source_stat = source_path.stat()
         image_sources.append(
             ImageSource(
@@ -305,7 +355,7 @@ def load_folder_snapshot(db: Session, folder_id: int) -> FolderExportSnapshot:
             )
         )
     if not image_sources:
-        raise ExportError("Folder 没有图片")
+        raise ExportError("folderNoImages")
     source_user_id, source_date = parse_source_identity(image_sources[0].name)
     metadata = {
         "clientRework": bool(folder.client_rework),
@@ -337,7 +387,7 @@ def load_folder_snapshot(db: Session, folder_id: int) -> FolderExportSnapshot:
     }
     missing = [name for name, value in required_metadata.items() if value in (None, "")]
     if missing:
-        raise ExportError(f"Folder 导出必填元数据缺失: {', '.join(missing)}")
+        raise ExportError("metadataMissing", {"fields": ", ".join(missing)})
     return FolderExportSnapshot(
         folder_id=folder.id,
         project_id=project.id,
@@ -386,7 +436,10 @@ def convert_to_tiff(source_path: Path, target_path: Path) -> tuple[int, int]:
     with Image.open(target_path) as result:
         compression = result.tag_v2.get(259)
         if compression not in DEFLATE_COMPRESSION_TAGS:
-            raise ExportError(f"TIFF 未使用 adobe_deflate: {target_path.name}")
+            raise ExportError(
+                "tiffCompressionInvalid",
+                {"filename": target_path.name},
+            )
         width, height = result.size
         result.verify()
     return width, height
@@ -412,10 +465,10 @@ def write_csv(
 def verify_sources_unchanged(snapshot: FolderExportSnapshot) -> None:
     for source in snapshot.images:
         if not source.path.is_file():
-            raise ExportError(f"导出期间源图片被删除: {source.name}")
+            raise ExportError("sourceDeleted", {"filename": source.name})
         current = source.path.stat()
         if current.st_size != source.size or current.st_mtime_ns != source.mtime_ns:
-            raise ExportError(f"导出期间源图片发生变化: {source.name}")
+            raise ExportError("sourceChanged", {"filename": source.name})
 
 
 def build_export_zip(
@@ -485,9 +538,9 @@ def build_export_zip(
     ]
     with zipfile.ZipFile(zip_path) as archive:
         if archive.namelist() != expected_names:
-            raise ExportError("ZIP 内文件结构或顺序不符合契约")
+            raise ExportError("zipStructureInvalid")
         if archive.testzip() is not None:
-            raise ExportError("ZIP CRC 校验失败")
+            raise ExportError("zipCrcInvalid")
     return ExportedZip(
         path=zip_path,
         size=zip_path.stat().st_size,
@@ -507,9 +560,9 @@ def verify_published_zip(path: Path, group_id: str, artifact_count: int) -> None
     try:
         with zipfile.ZipFile(path) as archive:
             if archive.namelist() != expected_names or archive.testzip() is not None:
-                raise ExportError("已发布 ZIP 校验失败")
+                raise ExportError("publishedZipInvalid")
     except (OSError, zipfile.BadZipFile) as error:
-        raise ExportError(f"已发布 ZIP 无法读取: {path}") from error
+        raise ExportError("publishedZipUnreadable", {"path": str(path)}) from error
 
 
 def publish_zip(exported: ExportedZip, group_id: str, config: ExportRuntimeConfig) -> Path:
@@ -521,7 +574,7 @@ def publish_zip(exported: ExportedZip, group_id: str, config: ExportRuntimeConfi
         same_size = final_path.stat().st_size == exported.size
         if same_size and sha256_file(final_path) == exported.sha256:
             return final_path
-        raise ExportError(f"最终目录存在不同内容的同名 ZIP: {final_path.name}")
+        raise ExportError("zipConflict", {"filename": final_path.name})
     try:
         shutil.copyfile(exported.path, partial_path)
         with partial_path.open("rb+") as output:
@@ -531,7 +584,7 @@ def publish_zip(exported: ExportedZip, group_id: str, config: ExportRuntimeConfi
             partial_path.stat().st_size != exported.size
             or sha256_file(partial_path) != exported.sha256
         ):
-            raise ExportError("ZIP 复制到最终目录后校验失败")
+            raise ExportError("zipCopyValidationFailed")
         os.replace(partial_path, final_path)
     finally:
         partial_path.unlink(missing_ok=True)
@@ -547,13 +600,13 @@ def finalize_folder(folder_id: int, group_id: str) -> None:
             .with_for_update(of=CaptureFolder)
         )
         if folder is None or folder.is_deleted:
-            raise ExportError("最终写回时 Folder 不存在或已删除")
+            raise ExportError("folderMissingAtFinalize")
         if folder.is_exported:
             if folder.group_id != group_id:
-                raise ExportError("Folder 已由其他导出写入不同 Group ID")
+                raise ExportError("folderGroupConflict")
             return
         if folder.qc_status.lower() != "pass":
-            raise ExportError("最终写回时 Folder 已不再是 PASS")
+            raise ExportError("folderNotPassAtFinalize")
         folder.group_id = group_id
         folder.is_tif_converted = True
         folder.is_exported = True
@@ -727,13 +780,13 @@ class ExportCoordinator:
             return None
 
     def preflight(self, db: Session) -> dict[str, Any]:
-        errors: list[str] = []
+        errors: list[dict[str, Any]] = []
         config: ExportRuntimeConfig | None = None
         try:
             config = runtime_config()
             validate_runtime_paths(config)
         except ExportError as error:
-            errors.append(str(error))
+            errors.append(error.to_dict())
         eligible_conditions = [
             func.lower(CaptureFolder.qc_status) == "pass",
             CaptureFolder.is_exported.is_not(True),
@@ -781,7 +834,7 @@ class ExportCoordinator:
                         }
                     )
         if invalid_projects:
-            errors.append("存在 projects.project_id 无效的项目")
+            errors.append(ExportError("invalidProjects").to_dict())
         return {
             "ready": not errors,
             "errors": errors,
@@ -802,11 +855,11 @@ class ExportCoordinator:
         self._cleanup_workspaces(config)
         with self._start_lock:
             if self._thread is not None and self._thread.is_alive():
-                raise ExportError("已有导出任务正在运行")
+                raise ExportError("taskAlreadyRunning")
             with SessionLocal() as db:
                 selected = folder_ids if folder_ids is not None else eligible_folder_ids(db)
                 if not selected:
-                    raise ExportError("没有可导出的 PASS Folder")
+                    raise ExportError("noEligibleFolders")
             state = {
                 "runId": uuid.uuid4().hex,
                 "status": "QUEUED",
@@ -829,6 +882,8 @@ class ExportCoordinator:
                         "zipSize": None,
                         "zipSha256": None,
                         "error": None,
+                        "errorKey": None,
+                        "errorParams": None,
                     }
                     for folder_id in selected
                 ],
@@ -862,7 +917,9 @@ class ExportCoordinator:
         for item in state.get("items", []):
             if item.get("status") == "RUNNING":
                 item["status"] = "PENDING"
-                item["error"] = "服务重启后重新处理"
+                error = ExportError("serviceRestarted")
+                item["error"] = str(error)
+                item.update(error.to_dict())
         state["status"] = "QUEUED"
         with self._state_lock:
             self._state = state
@@ -910,11 +967,33 @@ class ExportCoordinator:
             with self._state_lock:
                 if self._state:
                     self._state["currentFolderId"] = folder_id
-            self._set_item(config, item, status="RUNNING", error=None)
+            self._set_item(
+                config,
+                item,
+                status="RUNNING",
+                error=None,
+                errorKey=None,
+                errorParams=None,
+            )
             try:
                 self._export_one(folder_id, run_id, config, item)
+            except ExportError as error:
+                self._set_item(
+                    config,
+                    item,
+                    status="FAILED",
+                    error=str(error),
+                    **error.to_dict(),
+                )
             except Exception as error:
-                self._set_item(config, item, status="FAILED", error=str(error))
+                export_error = ExportError("unexpected")
+                self._set_item(
+                    config,
+                    item,
+                    status="FAILED",
+                    error=str(error) or str(export_error),
+                    **export_error.to_dict(),
+                )
         with self._state_lock:
             if self._state:
                 succeeded = int(self._state["succeeded"])
@@ -946,11 +1025,13 @@ class ExportCoordinator:
                 )
             )
             if not acquired:
+                error = ExportError("folderBusy")
                 self._set_item(
                     config,
                     item,
                     status="SKIPPED_BUSY",
-                    error="Folder 正由另一工作站导出",
+                    error=str(error),
+                    **error.to_dict(),
                 )
                 return
             try:

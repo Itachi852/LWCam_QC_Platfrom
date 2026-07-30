@@ -5,9 +5,9 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import AppShell from '@/components/AppShell.vue'
 import { adminApi } from '@/api'
 import { useAdaptivePageSize } from '@/composables/useAdaptivePageSize'
-import type { ExportFolder, ExportPreflight, ExportRun } from '@/types'
+import type { ExportFolder, ExportIssue, ExportPreflight, ExportRun, ExportRunItem } from '@/types'
 
-const { t } = useI18n()
+const { t, te, locale } = useI18n()
 const { pageSize } = useAdaptivePageSize({
   rowHeight: 52,
   headerHeight: 430,
@@ -112,9 +112,9 @@ function showFailureNotice(run?: ExportRun) {
   const details = visibleItems
     .map((item) => t('admin.exports.failedItem', {
       id: item.folderId,
-      error: item.error || t('admin.exports.unknownError'),
+      error: exportErrorMessage(item),
     }))
-    .join('；')
+    .join(locale.value === 'zh-CN' ? '；' : '; ')
   const remaining = failedItems.length - visibleItems.length
   const more = remaining > 0 ? t('admin.exports.failedMore', { count: remaining }) : ''
   ElMessage({
@@ -127,6 +127,28 @@ function showFailureNotice(run?: ExportRun) {
     duration: 10000,
     showClose: true,
   })
+}
+
+function exportErrorMessage(issue?: ExportIssue | ExportRunItem) {
+  if (issue?.errorKey) {
+    const key = `admin.exports.errors.${issue.errorKey}`
+    if (te(key)) return t(key, issue.errorParams || {})
+  }
+  if ('error' in (issue || {}) && (issue as ExportRunItem).error) {
+    return (issue as ExportRunItem).error as string
+  }
+  return t('admin.exports.unknownError')
+}
+
+const preflightErrorDescription = computed(() =>
+  (preflight.value?.errors || [])
+    .map((issue) => exportErrorMessage(issue))
+    .join(locale.value === 'zh-CN' ? '；' : '; '),
+)
+
+function qcStatusLabel(status: string) {
+  const key = `admin.exports.qcStatuses.${status.toLowerCase()}`
+  return te(key) ? t(key) : status
 }
 
 async function poll() {
@@ -180,7 +202,7 @@ function exportActionLabel(folder: ExportFolder) {
 function formatDate(value?: string) {
   if (!value) return '—'
   const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString(locale.value)
 }
 
 function changePage(nextPage: number) {
@@ -241,7 +263,7 @@ watch(pageSize, () => {
       v-if="preflight && !preflight.ready"
       type="error"
       :title="t('admin.exports.notReady')"
-      :description="preflight.errors.join('；')"
+      :description="preflightErrorDescription"
       show-icon
       :closable="false"
     />
@@ -284,7 +306,7 @@ watch(pageSize, () => {
         </el-select>
       </div>
       <el-table v-if="folders.length" v-loading="folderLoading" :data="folders" max-height="560">
-        <el-table-column prop="folderId" label="Folder ID" width="110" />
+        <el-table-column prop="folderId" :label="t('admin.exports.folderId')" width="110" />
         <el-table-column prop="folderName" :label="t('admin.exports.folder')" min-width="180" show-overflow-tooltip />
         <el-table-column prop="folderSeq" :label="t('admin.exports.sequence')" width="100" />
         <el-table-column prop="boxName" :label="t('admin.exports.box')" min-width="160" show-overflow-tooltip />
@@ -292,7 +314,9 @@ watch(pageSize, () => {
           <template #default="{ row }">{{ row.projectId }} · {{ row.projectName }}</template>
         </el-table-column>
         <el-table-column prop="imageCount" :label="t('admin.exports.images')" width="110" />
-        <el-table-column prop="qcStatus" label="QC" width="105" />
+        <el-table-column :label="t('admin.exports.qc')" width="105">
+          <template #default="{ row }">{{ qcStatusLabel(row.qcStatus) }}</template>
+        </el-table-column>
         <el-table-column :label="t('admin.exports.exportStatus')" width="120">
           <template #default="{ row }">
             <el-tag :type="row.isExported ? 'success' : 'info'">
@@ -300,7 +324,7 @@ watch(pageSize, () => {
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="groupId" label="Group ID" min-width="220" show-overflow-tooltip />
+        <el-table-column prop="groupId" :label="t('admin.exports.groupId')" min-width="220" show-overflow-tooltip />
         <el-table-column :label="t('admin.exports.exportedAt')" min-width="180">
           <template #default="{ row }">{{ formatDate(row.exportedTime) }}</template>
         </el-table-column>
