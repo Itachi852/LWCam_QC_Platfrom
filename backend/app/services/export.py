@@ -212,9 +212,7 @@ def validate_runtime_paths(config: ExportRuntimeConfig) -> None:
 
 
 def project_ingest_id(project: Project) -> str:
-    template = project.template if isinstance(project.template, dict) else {}
-    ingest = template.get("ingest") if isinstance(template.get("ingest"), dict) else {}
-    value = str(ingest.get("project_id") or project.project_id or "").strip()
+    value = str(project.project_id or "").strip()
     if not value:
         raise ExportError("projectIdMissing", {"project": project.project_name})
     validate_group_part("ProjectID", value)

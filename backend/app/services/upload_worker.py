@@ -80,7 +80,6 @@ class UploadCandidate:
     group_id: str
     project_id: str
     site_id: str
-    region: str
     title: str
 
 
@@ -161,11 +160,11 @@ def candidate_from_folder(folder: CaptureFolder) -> UploadCandidate | None:
         raise UploadConfigurationError(f"folder {folder.id} has no active project")
     template = project.template if isinstance(project.template, dict) else {}
     ingest = template.get("ingest")
-    if not isinstance(ingest, dict):
+    if ingest is not None and not isinstance(ingest, dict):
         raise UploadConfigurationError(
-            f"project {project.project_id} is missing template.ingest"
+            f"project {project.project_id} template.ingest must be an object"
         )
-    enabled = ingest.get("enabled", True)
+    enabled = ingest.get("enabled", True) if isinstance(ingest, dict) else True
     if enabled is False:
         return None
     if enabled is not True:
@@ -177,18 +176,14 @@ def candidate_from_folder(folder: CaptureFolder) -> UploadCandidate | None:
         raise UploadConfigurationError(
             f"folder {folder.id} has an invalid group_id"
         )
-    project_id = str(ingest.get("project_id") or project.project_id or "").strip()
-    site_id = str(ingest.get("site_id") or "").strip()
-    region = str(ingest.get("region") or "").strip()
-    title = str(
-        ingest.get("title") or folder.title or project.project_name or ""
-    ).strip()
+    project_id = str(project.project_id or "").strip()
+    site_id = str(project.country_location_code or "").strip()
+    title = str(folder.title or project.project_name or "").strip()
     missing = [
         name
         for name, value in (
             ("project_id", project_id),
             ("site_id", site_id),
-            ("region", region),
             ("title", title),
         )
         if not value
@@ -202,7 +197,6 @@ def candidate_from_folder(folder: CaptureFolder) -> UploadCandidate | None:
         group_id=group_id,
         project_id=project_id,
         site_id=site_id,
-        region=region,
         title=title,
     )
 
@@ -732,8 +726,18 @@ class UploadWorker:
         assert self._runtime is not None
         if not claimed.exists():
             return
+        destination = self._runtime.failed_dir / filename
         try:
-            self._move_without_overwrite(claimed, self._runtime.failed_dir / filename)
+            if destination.is_file():
+                same_size = claimed.stat().st_size == destination.stat().st_size
+                if same_size and sha256_file(claimed) == sha256_file(destination):
+                    claimed.unlink()
+                    logger.info(
+                        "Failed upload %s was already archived; removed duplicate claim",
+                        filename,
+                    )
+                    return
+            self._move_without_overwrite(claimed, destination)
         except OSError:
             logger.exception("Could not move failed upload %s", filename)
 
@@ -791,6 +795,9 @@ class UploadWorker:
             "error": self._sanitize(str(error)),
             "httpStatus": getattr(error, "status_code", None),
         }
+        response_payload = getattr(error, "response_payload", None)
+        if response_payload is not None:
+            payload["confirmResponse"] = response_payload
         temporary.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",

@@ -2,6 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import requests
+
 from app.services.ingest_client import IngestClient, IngestError
 
 
@@ -21,8 +23,12 @@ class FakeSession:
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls = []
+        self.sent_bodies = []
 
     def request(self, method, url, **kwargs):
+        data = kwargs.get("data")
+        if data is not None and not isinstance(data, dict):
+            self.sent_bodies.append(b"".join(data))
         self.calls.append((method, url, kwargs))
         return self.responses.pop(0)
 
@@ -41,6 +47,21 @@ def client(session):
 
 
 class IngestClientTests(unittest.TestCase):
+    def test_owned_session_does_not_inherit_system_proxy(self):
+        owned = IngestClient(
+            api_base_url="http://ingest.test",
+            api_authorization="Basic api-token",
+            hfs_upload_url="http://hfs.test/ScanImages",
+            hfs_username="hfs-user",
+            hfs_password="hfs-password",
+            connect_timeout=1,
+            read_timeout=2,
+        )
+        try:
+            self.assertFalse(owned.session.trust_env)
+        finally:
+            owned.close()
+
     def test_check_requires_boolean_result(self):
         session = FakeSession([FakeResponse({"result": False})])
 
@@ -88,8 +109,56 @@ class IngestClientTests(unittest.TestCase):
         client(successful).confirm_zip_uploaded("a" * 64, "ZIP-1", "G1.zip")
 
         ambiguous = FakeSession([FakeResponse({"message": "received"})])
-        with self.assertRaisesRegex(IngestError, "not explicitly successful"):
+        with self.assertRaisesRegex(IngestError, "not explicitly successful") as raised:
             client(ambiguous).confirm_zip_uploaded("a" * 64, "ZIP-1", "G1.zip")
+        self.assertEqual(raised.exception.status_code, 200)
+        self.assertEqual(raised.exception.response_payload, {"message": "received"})
+
+    def test_confirm_accepts_valid_file_signature_response(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    {
+                        "file_name": "G1.zip",
+                        "is_match": True,
+                        "message": "file signature is valid",
+                        "trace_id": "trace-123",
+                    }
+                )
+            ]
+        )
+
+        client(session).confirm_zip_uploaded("a" * 64, "ZIP-1", "G1.zip")
+
+    def test_confirm_rejects_invalid_file_signature(self):
+        session = FakeSession(
+            [
+                FakeResponse(
+                    {
+                        "file_name": "G1.zip",
+                        "is_match": False,
+                        "message": "file signature is invalid",
+                        "trace_id": "trace-123",
+                    }
+                )
+            ]
+        )
+
+        with self.assertRaisesRegex(IngestError, "not explicitly successful"):
+            client(session).confirm_zip_uploaded("a" * 64, "ZIP-1", "G1.zip")
+
+    def test_confirm_response_redacts_sensitive_fields(self):
+        session = FakeSession(
+            [FakeResponse({"message": "received", "token": "do-not-record"})]
+        )
+
+        with self.assertRaises(IngestError) as raised:
+            client(session).confirm_zip_uploaded("a" * 64, "ZIP-1", "G1.zip")
+
+        self.assertEqual(
+            raised.exception.response_payload,
+            {"message": "received", "token": "<redacted>"},
+        )
 
     def test_upload_streams_the_zip_with_basic_auth(self):
         session = FakeSession([FakeResponse("ok")])
@@ -99,7 +168,7 @@ class IngestClientTests(unittest.TestCase):
 
             result = client(session).upload_zip(path)
             _, url, kwargs = session.calls[0]
-            sent = b"".join(kwargs["data"])
+            sent = session.sent_bodies[0]
 
         self.assertEqual(url, "http://hfs.test/ScanImages")
         self.assertIn(b"zip-content", sent)
@@ -110,6 +179,48 @@ class IngestClientTests(unittest.TestCase):
         self.assertEqual(kwargs["auth"].username, "hfs-user")
         self.assertEqual(kwargs["auth"].password, "hfs-password")
         self.assertGreater(result.duration_s, 0)
+
+    def test_multipart_stream_has_length_without_chunked_transfer_encoding(self):
+        session = FakeSession([FakeResponse("ok")])
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "G1.zip.uploading"
+            path.write_bytes(b"zip-content")
+
+            client(session).upload_zip(path)
+            _, url, kwargs = session.calls[0]
+            prepared = requests.Request(
+                "POST",
+                url,
+                data=kwargs["data"],
+                headers=kwargs["headers"],
+            ).prepare()
+
+        self.assertIn("Content-Length", prepared.headers)
+        self.assertNotIn("Transfer-Encoding", prepared.headers)
+
+    def test_upload_closes_multipart_stream_after_connection_error(self):
+        class FailingStreamingSession:
+            body = None
+
+            def request(self, _method, _url, **kwargs):
+                self.body = kwargs["data"]
+                stream = iter(self.body)
+                next(stream)  # multipart prefix
+                next(stream)  # first file chunk; the file is now open
+                raise requests.exceptions.ProxyError("proxy reset")
+
+        session = FailingStreamingSession()
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "G1.zip.uploading"
+            destination = Path(temporary) / "G1.zip"
+            source.write_bytes(b"zip-content")
+
+            with self.assertRaisesRegex(IngestError, "ProxyError"):
+                client(session).upload_zip(source)
+
+            self.assertTrue(session.body.closed)
+            source.rename(destination)
+            self.assertTrue(destination.is_file())
 
 
 if __name__ == "__main__":

@@ -160,18 +160,13 @@ class UploadSafetyTests(unittest.TestCase):
             self.assertFalse(worker.start())
             self.assertFalse(missing.exists())
 
-    def test_project_ingest_config_uses_template_and_legacy_project_id_fallback(self):
+    def test_candidate_uses_project_database_fields_without_ingest_template(self):
         project = SimpleNamespace(
-            project_id="LEGACY-PROJECT",
+            project_id="DATABASE-PROJECT",
             project_name="Project name",
+            country_location_code="ZA",
             is_deleted=False,
-            template={
-                "ingest": {
-                    "site_id": "ZA",
-                    "region": "ZA",
-                    "title": "Ingest title",
-                }
-            },
+            template={},
         )
         folder = SimpleNamespace(
             id=1,
@@ -183,9 +178,9 @@ class UploadSafetyTests(unittest.TestCase):
         candidate = candidate_from_folder(folder)
 
         self.assertIsNotNone(candidate)
-        self.assertEqual(candidate.project_id, "LEGACY-PROJECT")
+        self.assertEqual(candidate.project_id, "DATABASE-PROJECT")
         self.assertEqual(candidate.site_id, "ZA")
-        self.assertEqual(candidate.title, "Ingest title")
+        self.assertEqual(candidate.title, "Folder title")
 
     def test_disabled_project_is_not_a_candidate(self):
         project = SimpleNamespace(
@@ -235,7 +230,6 @@ class UploadSafetyTests(unittest.TestCase):
                         group_id="G1",
                         project_id="PROJECT",
                         site_id="ZA",
-                        region="ZA",
                         title="Title",
                     ),
                     image_count=2,
@@ -263,7 +257,6 @@ class UploadFlowTests(unittest.TestCase):
         group_id="G1",
         project_id="PROJECT",
         site_id="ZA",
-        region="ZA",
         title="Test project",
     )
 
@@ -328,6 +321,20 @@ class UploadFlowTests(unittest.TestCase):
             self.assertFalse((root / "failed" / "G1.zip").exists())
             self.assertEqual(marked, [])
             self.assertTrue((root / "reports" / "G1.error.json").is_file())
+
+    def test_failed_archive_removes_duplicate_claim_when_copy_already_exists(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worker, _, _ = self.make_worker(root, FakeClient())
+            claimed = root / "export" / "G1.zip.uploading"
+            archived = root / "failed" / "G1.zip"
+            write_zip(claimed)
+            archived.write_bytes(claimed.read_bytes())
+
+            worker._move_failed_claim(claimed, "G1.zip")
+
+            self.assertFalse(claimed.exists())
+            self.assertTrue(archived.is_file())
 
     def test_restart_restores_unfinished_claim_to_export(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -474,7 +481,6 @@ class UploadDiscoveryTests(unittest.TestCase):
                 group_id="G1",
                 project_id="PROJECT",
                 site_id="ZA",
-                region="ZA",
                 title="Title",
             )
             states = iter([("wait", None), ("ready", candidate)])
