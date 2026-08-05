@@ -171,6 +171,14 @@ docker compose logs -f frontend
 
 按 `Ctrl+C` 退出日志查看不会停止容器。
 
+后端同时将持久化日志写入项目根目录的 `logs` 文件夹：
+
+- `logs/lwcam.log`：应用、Uvicorn 错误和 HTTP 访问日志。
+- `logs/uploader.log`：Uploader 和 ingest client 日志。
+
+两个文件默认按 50 MB 轮转并各保留 10 个备份。可通过 `.env` 中的
+`LOG_HOST_PATH`、`LOG_LEVEL`、`LOG_MAX_BYTES` 和 `LOG_BACKUP_COUNT` 调整；日志目录无法写入时后端不会启动。
+
 ### 7. 验证外部数据库连接
 
 服务启动后，可以在后端容器中执行一次简单查询：

@@ -1,8 +1,17 @@
 from functools import cached_property
+from pathlib import Path
 from typing import Any
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _default_log_dir() -> str:
+    """Keep source checkouts and the Docker image on the same logs/ convention."""
+    backend_root = Path(__file__).resolve().parents[2]
+    if backend_root.name.casefold() == "backend":
+        return str(backend_root.parent / "logs")
+    return str(backend_root / "logs")
 
 
 class Settings(BaseSettings):
@@ -12,6 +21,10 @@ class Settings(BaseSettings):
     app_env: str = "development"
     app_debug: bool = True
     api_prefix: str = "/api"
+    log_dir: str = Field(default_factory=_default_log_dir)
+    log_level: str = "INFO"
+    log_max_bytes: int = Field(default=50 * 1024 * 1024, ge=1)
+    log_backup_count: int = Field(default=10, ge=0)
 
     db_host: str = "localhost"
     db_port: int = 5432
@@ -75,6 +88,14 @@ class Settings(BaseSettings):
         if value is True:
             return True
         return isinstance(value, str) and value.strip().lower() == "true"
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def validate_log_level(cls, value: Any) -> str:
+        result = str(value or "").strip().upper()
+        if result not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+        return result
 
     @cached_property
     def database_url(self) -> str:

@@ -8,6 +8,10 @@ services:
       APP_ENV: docker
       APP_DEBUG: ${APP_DEBUG:-false}
       API_PREFIX: /api
+      LOG_DIR: /app/logs
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_MAX_BYTES: ${LOG_MAX_BYTES:-52428800}
+      LOG_BACKUP_COUNT: ${LOG_BACKUP_COUNT:-10}
       DB_HOST: ${DB_HOST:-host.docker.internal}
       DB_PORT: ${DB_PORT:-5432}
       DB_NAME: ${DB_NAME:-lwcam}
@@ -67,6 +71,9 @@ services:
       - type: volume
         source: lwcam_py_backend_cache
         target: /app/.cache
+      - type: bind
+        source: ${LOG_HOST_PATH:-./logs}
+        target: /app/logs
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     extra_hosts:

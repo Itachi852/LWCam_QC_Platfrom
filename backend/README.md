@@ -19,4 +19,8 @@ pip install -e ".[dev]"
 uvicorn app.main:app --reload --port 8080
 ```
 
+后端运行日志默认写入项目根目录的 `logs/lwcam.log` 和
+`logs/uploader.log`。两个文件按 50 MB 轮转并各保留 10 个备份；本地运行时可通过
+`LOG_DIR`、`LOG_LEVEL`、`LOG_MAX_BYTES` 和 `LOG_BACKUP_COUNT` 覆盖默认配置。
+
 Folder 图片目录由数据库中的 `folder_path`/`thumbnail_path` 提供，运行账户必须拥有读取权限。
