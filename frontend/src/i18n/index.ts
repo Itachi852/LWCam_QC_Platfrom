@@ -7,18 +7,10 @@ import enUS from '@/i18n/locales/en-US'
 
 export type AppLocale = 'zh-CN' | 'en-US'
 
-const STORAGE_KEY = 'lwcam-locale'
-
-function initialLocale(): AppLocale {
-  const stored = localStorage.getItem(STORAGE_KEY)
-  if (stored === 'zh-CN' || stored === 'en-US') return stored
-  return 'zh-CN'
-}
-
 export const i18n = createI18n({
   legacy: false,
-  locale: initialLocale(),
-  fallbackLocale: 'zh-CN',
+  locale: 'en-US',
+  fallbackLocale: 'en-US',
   messages: {
     'zh-CN': zhCN,
     'en-US': enUS,
@@ -29,16 +21,7 @@ export function useAppLocale() {
   const locale = computed(() => i18n.global.locale.value as AppLocale)
   const elementLocale = computed(() => (locale.value === 'en-US' ? en : zhCn))
 
-  function setLocale(value: AppLocale) {
-    i18n.global.locale.value = value
-    localStorage.setItem(STORAGE_KEY, value)
-  }
-
-  function toggleLocale() {
-    setLocale(locale.value === 'zh-CN' ? 'en-US' : 'zh-CN')
-  }
-
-  return { locale, elementLocale, setLocale, toggleLocale }
+  return { locale, elementLocale }
 }
 
 export function translateValue(prefix: string, value: string | undefined | null) {

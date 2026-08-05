@@ -11,3 +11,6 @@ pillow>=10.4.0
 numpy>=1.26.0
 python-multipart>=0.0.9
 alembic>=1.13.0
+requests>=2.32.0
+mysql-connector-python>=9.0.0
+watchdog>=6.0.0

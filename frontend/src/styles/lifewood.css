@@ -155,12 +155,6 @@ textarea {
   letter-spacing: 0;
 }
 
-.auth-language {
-  display: flex;
-  justify-content: flex-end;
-  margin: -8px 0 8px;
-}
-
 .auth-form .hint,
 .page-title p,
 .muted {
@@ -289,19 +283,6 @@ textarea {
 .topbar-action-button.el-button:focus-visible {
   outline: 2px solid rgba(255, 179, 71, 0.72);
   outline-offset: 2px;
-}
-
-.topbar-action-button--language.el-button {
-  border-color: rgba(255, 179, 71, 0.72);
-  background: var(--lw-saffron);
-  color: var(--lw-dark);
-}
-
-.topbar-action-button--language.el-button:hover,
-.topbar-action-button--language.el-button:focus {
-  border-color: var(--lw-earth);
-  background: var(--lw-earth);
-  color: var(--lw-dark);
 }
 
 .content {

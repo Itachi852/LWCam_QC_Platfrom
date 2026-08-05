@@ -8,3 +8,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+# The legacy handover tool contains hardcoded production credentials. Keep the
+# local reference copy, but never commit or package it.
+app/Uploader/
+Uploader/

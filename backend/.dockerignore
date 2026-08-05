@@ -10,4 +10,8 @@ __pycache__
 .mypy_cache
 .env
 tests
+# Legacy handover tool contains environment-specific paths/credentials and is
+# not part of the integrated backend runtime.
+app/Uploader
+Uploader
 

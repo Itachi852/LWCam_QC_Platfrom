@@ -4,14 +4,12 @@ import { useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { ElMessage } from 'element-plus'
 import { authApi } from '@/api'
-import { useAppLocale } from '@/i18n'
 import { useAuthStore } from '@/stores/auth'
-import logoCn from '@/assets/lifewood-logo-cn.jpg'
+import logo from '@/assets/lifewood-logo.jpg'
 
 const router = useRouter()
 const auth = useAuthStore()
 const { t } = useI18n()
-const { locale, toggleLocale } = useAppLocale()
 const loading = ref(false)
 const form = reactive({ oldPassword: '', newPassword: '', confirmPassword: '' })
 
@@ -43,18 +41,13 @@ async function submit() {
   <div class="auth-page">
     <section class="brand-panel">
       <div>
-        <img :src="logoCn" :alt="t('common.logoAlt')" />
+        <img :src="logo" :alt="t('common.logoAlt')" />
         <h1>LWCam</h1>
         <p>{{ t('common.appSubtitle') }}</p>
       </div>
     </section>
     <section class="auth-form-wrap">
       <el-form class="auth-form" :model="form" label-position="top" @keyup.enter="submit">
-        <div class="auth-language">
-          <el-button text :icon="'Connection'" @click="toggleLocale">
-            {{ locale === 'zh-CN' ? t('common.languageEnglish') : t('common.languageChinese') }}
-          </el-button>
-        </div>
         <h2>{{ t('auth.changePassword') }}</h2>
         <p class="hint">{{ t('auth.changePasswordHint') }}</p>
         <el-form-item :label="t('auth.oldPassword')">

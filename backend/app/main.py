@@ -7,12 +7,18 @@ from app.core.config import settings
 from app.core.errors import register_exception_handlers
 from app.routers import api_router
 from app.services.export import export_coordinator
+from app.services.upload_worker import upload_worker
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     export_coordinator.resume_if_needed()
-    yield
+    if settings.upload_enabled:
+        upload_worker.start()
+    try:
+        yield
+    finally:
+        upload_worker.stop()
 
 
 def create_app() -> FastAPI:

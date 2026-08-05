@@ -2,7 +2,7 @@
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
-import { translateValue, useAppLocale } from '@/i18n'
+import { translateValue } from '@/i18n'
 import { useAuthStore } from '@/stores/auth'
 import logo from '@/assets/lifewood-logo.jpg'
 
@@ -10,7 +10,6 @@ const auth = useAuthStore()
 const route = useRoute()
 const router = useRouter()
 const { t } = useI18n()
-const { locale, toggleLocale } = useAppLocale()
 
 const navItems = computed(() => {
   const role = auth.user?.role
@@ -59,7 +58,6 @@ function logout() {
           <span v-if="auth.user?.mustChangePassword" class="muted"> · {{ t('auth.passwordChangeHint') }}</span>
         </div>
         <div class="topbar-actions">
-          <el-button class="topbar-action-button topbar-action-button--language" :icon="'Connection'" @click="toggleLocale">{{ locale === 'zh-CN' ? t('common.languageEnglish') : t('common.languageChinese') }}</el-button>
           <el-button class="topbar-action-button" :icon="'SwitchButton'" @click="logout">{{ t('common.logout') }}</el-button>
         </div>
       </header>
